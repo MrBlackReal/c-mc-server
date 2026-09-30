@@ -1,0 +1,7 @@
+build/
+build-*/
+run/
+data/
+*.jar
+compile_commands.json
+__pycache__/
