@@ -55,18 +55,35 @@ class DropClient(tb.Client):
                         self.entities[eid]["item"] = val
                         self.spawned[eid] = val
                         self.first.setdefault(eid, val)  # before any merging
+                elif ser == 0:  # Byte (the shared flags: on fire)
+                    flags = r.u8()
+                    if eid in self.entities and idx == 0:
+                        self.entities[eid]["on_fire"] = bool(flags & 1)
                 else:
                     break  # other serializers not needed here
         elif n == "entity_position_sync":
             eid = r.varint()
-            if r.varint() == 0 and eid in self.entities:  # PositionPath.Linear (stepped paths: not needed)
-                self.entities[eid]["pos"] = (r.f64(), r.f64(), r.f64())
+            if r.varint() == 0:  # PositionPath.Linear
+                pos = (r.f64(), r.f64(), r.f64())
+            else:  # PositionPath.Stepped: (position, tick offset) steps; it ends at the last
+                pos = None
+                for _ in range(r.varint()):
+                    pos = (r.f64(), r.f64(), r.f64())
+                    r.varint()
+            if pos and eid in self.entities:
+                self.entities[eid]["pos"] = pos
                 self.track(eid)
         elif n in ("move_entity_pos", "move_entity_pos_rot"):
+            # ClientboundMoveEntityPacket: properties (onGround | stepCount << 1), then a VecDelta:
+            # one (x, y, z) delta in 1/4096 blocks, or that many (tick offset, delta) steps
             eid = r.varint()
+            steps = r.varint() >> 1
+            deltas = [(r.i16(), r.i16(), r.i16())] if steps == 0 else [(r.varint(), r.i16(), r.i16(), r.i16())[1:] for _ in range(steps)]
             if eid in self.entities:
                 x, y, z = self.entities[eid]["pos"]
-                self.entities[eid]["pos"] = (x + r.i16() / 4096, y + r.i16() / 4096, z + r.i16() / 4096)
+                for dx, dy, dz in deltas:
+                    x, y, z = x + dx / 4096, y + dy / 4096, z + dz / 4096
+                self.entities[eid]["pos"] = (x, y, z)
                 self.track(eid)
         elif n == "remove_entities":
             for _ in range(r.varint()):

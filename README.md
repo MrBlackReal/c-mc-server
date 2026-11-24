@@ -150,6 +150,9 @@ obvious counterpart to compare against:
 - Buckets: filling from sources and waterlogged blocks (and powder snow), emptying into air, into
   replaceable blocks (dropping them) and into waterloggable blocks; campfires and candles go out.
   Sponges soak up water; water over soul sand or magma becomes a bubble column (and back)
+- Items and experience orbs in fluids: currents carry them, they float up in water, splash when
+  they fall in; lava and fire set them alight and burn them up (shulker boxes and bundles spill
+  their contents), unless they're fire resistant like netherite; water puts them out
 - Neighbour updates: a port of `CollectingNeighborUpdater` runs shape updates and `neighborChanged`
   in vanilla's order (and limits); `/fill` and `/setblock` update neighbours like vanilla
 - Commands go through a port of Brigadier with vanilla's command tree, permissions, error messages
@@ -161,14 +164,14 @@ obvious counterpart to compare against:
 Known gaps: bone meal on grass, moss, nylium, fungi and flowers (they place world-gen features);
 turtle eggs don't hatch and dried ghasts stay hydrated (no mobs); no food/hunger, mobs,
 explosions, portals, weather, maps (cartography table) or redstone (so nothing reacts to
-`neighborChanged` but fluids and sponges); entities don't float or drift in
-fluids; fish buckets release no fish; dispensers don't use buckets; Haste/Mining Fatigue
+`neighborChanged` but fluids and sponges); fish buckets release no fish; dispensers don't
+use buckets (they need redstone); Haste/Mining Fatigue
 don't affect dig speed; the anvil compares a typed name with the item's name key, not its English
 text.
 
 **Next milestones**
 1. Redstone
-2. Nether/End, entities, AI, physics (swimming, items floating); noise world generation; the rest
+2. Nether/End, entities, AI, physics (swimming); noise world generation; the rest
    of the commands; using items in the air (food, bows, potions, spawn eggs)
 
 Known shortcuts are marked `TODO` in the source.
@@ -219,6 +222,7 @@ tools/run_test.sh tools/test_random_ticks.py    # growth, decay, melting with ra
 tools/run_test.sh tools/test_bone_meal.py       # trees, crops, huge mushrooms from bone meal
 tools/run_test.sh tools/test_fluids.py          # flowing, sources, lava and water, sponges, buckets
 FLUID_DUMP=out.json tools/run_test.sh tools/test_fluids.py  # + every block changed, to diff with vanilla's
+tools/run_test.sh tools/test_fluid_entities.py  # items drifting, floating and burning
 BUNDLE=<unzipped jar> tools/feature_check.sh    # trees/huge mushrooms vs vanilla's code, same seeds
 tools/test_online.sh                            # online-mode logins, both servers, stand-in services
 tools/test_chat.sh                              # secure chat with enforce-secure-profile, both servers

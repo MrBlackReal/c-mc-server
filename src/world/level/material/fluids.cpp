@@ -1,6 +1,7 @@
 #include "world/level/material/fluids.hpp"
 
 #include <array>
+#include <cmath>
 #include <string>
 #include <unordered_map>
 
@@ -270,6 +271,54 @@ float ownHeight(FluidState f) { return f.isEmpty() ? 0.0f : f.amount / 9.0f; }
 float height(ServerLevel& level, BlockPos pos, FluidState f) {
     if (f.isEmpty()) return 0.0f;
     return isSame(f.type, stateOf(level.getBlockState(pos.above())).type) ? 1.0f : ownHeight(f); // hasSameAbove
+}
+
+std::array<double, 3> flow(ServerLevel& level, BlockPos pos, FluidState fluid) {
+    auto normalize = [](double x, double y, double z) -> std::array<double, 3> { // Vec3.normalize
+        double d = std::sqrt(x * x + y * y + z * z);
+        return d < 1.0e-5f ? std::array<double, 3>{0, 0, 0} : std::array<double, 3>{x / d, y / d, z / d};
+    };
+    if (fluid.isEmpty()) return {0, 0, 0}; // (EmptyFluid)
+    auto affectsFlow = [&](FluidState n) { return n.isEmpty() || isSame(n.type, fluid.type); };
+    double flowX = 0, flowZ = 0;
+    for (Direction d : direction::kHorizontalPlane) {
+        BlockPos np = pos.relative(d);
+        FluidState neighbour = stateOf(level.getBlockState(np));
+        if (!affectsFlow(neighbour)) continue;
+        float neighbourHeight = ownHeight(neighbour);
+        float distance = 0.0f;
+        if (neighbourHeight == 0.0f) {
+            if (!bs::stateHasTag(level.getBlockState(np), "minecraft:blocks_fluid_flow")) {
+                FluidState below = stateOf(level.getBlockState(np.below()));
+                if (affectsFlow(below)) {
+                    neighbourHeight = ownHeight(below);
+                    if (neighbourHeight > 0.0f) distance = ownHeight(fluid) - (neighbourHeight - 0.8888889f);
+                }
+            }
+        } else if (neighbourHeight > 0.0f) {
+            distance = ownHeight(fluid) - neighbourHeight;
+        }
+        if (distance != 0.0f) flowX += direction::stepX(d) * distance, flowZ += direction::stepZ(d) * distance;
+    }
+    std::array<double, 3> result{flowX, 0.0, flowZ};
+    if (fluid.falling) {
+        // isSolidFace: a sturdy face of something that isn't this fluid (ice doesn't count; up always does)
+        auto isSolidFace = [&](BlockPos p, Direction d) {
+            BlockStateId st = level.getBlockState(p);
+            if (isSame(stateOf(st).type, fluid.type)) return false;
+            if (d == Direction::Up) return true;
+            return !bs::isInstance(bs::blockOf(st), "IceBlock") && bs::isFaceSturdy(st, d);
+        };
+        for (Direction d : direction::kHorizontalPlane) {
+            BlockPos np = pos.relative(d);
+            if (isSolidFace(np, d) || isSolidFace(np.above(), d)) {
+                auto n = normalize(result[0], result[1], result[2]);
+                result = {n[0], n[1] - 6.0, n[2]};
+                break;
+            }
+        }
+    }
+    return normalize(result[0], result[1], result[2]);
 }
 
 void tick(ServerLevel& level, BlockPos pos, BlockStateId state, FluidState fluid) {

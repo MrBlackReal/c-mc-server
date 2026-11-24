@@ -35,9 +35,13 @@ public:
     int value = 0;
     int age = 0;
     int health = 5;
+    // ExperienceOrb.hurtServer: loses health (fire, lava, ...); gone at 0.
+    bool hurt(ServerLevel& level, std::string_view type, float amount) override;
     int count = 1;
 
 private:
+    int soundSource() const override { return 8; } // AMBIENT
+    void doWaterSplashEffect(ServerLevel&) override {}
     void followNearbyPlayer(ServerLevel& level);
     void scanForMerges(ServerLevel& level);
     int repairPlayerItems(ServerLevel& level, ServerPlayer& player, int amount);

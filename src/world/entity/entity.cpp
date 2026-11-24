@@ -5,6 +5,9 @@
 #include <cmath>
 
 #include "server/level/server_level.hpp"
+#include "core/registries.hpp"
+#include "world/level/block/block_behaviour.hpp"
+#include "world/level/material/fluids.hpp"
 
 namespace mc {
 
@@ -103,7 +106,7 @@ void Entity::saveBase(nbt::Compound& t) const {
     rot.items.push_back(xRot);
     t.put("Rotation", std::move(rot));
     t.put("fall_distance", 0.0);
-    t.put("Fire", static_cast<int16_t>(0));
+    t.put("Fire", static_cast<int16_t>(remainingFireTicks));
     t.put("Air", static_cast<int16_t>(300));
     t.put("OnGround", nbt::byteTag(onGround));
     t.put("Invulnerable", nbt::byteTag(false));
@@ -117,6 +120,7 @@ void Entity::loadBase(const nbt::Compound& t) {
     if (const nbt::List* r = t.getList("Rotation"); r && r->items.size() == 2)
         yRot = static_cast<float>(r->items[0].asDouble()), xRot = static_cast<float>(r->items[1].asDouble());
     onGround = t.getBool("OnGround");
+    if (t.contains("Fire")) remainingFireTicks = t.getInt("Fire");
 }
 
 std::optional<std::array<double, 3>> Entity::findFreePosition(ServerLevel& level, const AABB& allowed, double px, double py, double pz, double sx,
@@ -156,6 +160,168 @@ std::optional<std::array<double, 3>> Entity::findFreePosition(ServerLevel& level
                 if (!best || d < bestDist) best = std::array<double, 3>{cx, cy, cz}, bestDist = d;
             }
     return best;
+}
+
+// ---------------------------------------------------------------- fluids and fire
+
+void Entity::playSound(ServerLevel& level, std::string_view sound, float volume, float pitch) {
+    level.playSound(-1, x, y, z, registries::id("minecraft:sound_event", sound).value_or(-1), soundSource(), volume, pitch);
+}
+
+namespace {
+float nextFloat(std::mt19937& r) { return std::uniform_real_distribution<float>(0.0f, 1.0f)(r); }
+} // namespace
+
+void Entity::doWaterSplashEffect(ServerLevel& level) {
+    // (no passengers here)
+    float speed = std::min(1.0f, static_cast<float>(std::sqrt(vx * vx * 0.2f + vy * vy + vz * vz * 0.2f)) * 0.2f);
+    auto& r = level.random();
+    playSound(level, "minecraft:entity.generic.splash", speed, 1.0f + (nextFloat(r) - nextFloat(r)) * 0.4f);
+}
+
+bool Entity::updateFluidInteraction(ServerLevel& level) {
+    // EntityFluidInteraction.update: the fluids in the (slightly shrunk) bounding box, how high
+    // they reach above its bottom, whether the eyes are in them, and the sum of their flows.
+    fluidHeight_[0] = fluidHeight_[1] = 0.0;
+    eyeInFluid_[0] = eyeInFluid_[1] = false;
+    double typeHeight[5] = {0, 0, 0, 0, 0}; // (a tracker per fluid type, as vanilla keeps them)
+    struct Current {
+        double height = 0, x = 0, y = 0, z = 0;
+        int count = 0;
+    } current[2];
+    AABB box = boundingBox().inflate(-0.001, -0.001, -0.001);
+    int x0 = floorInt(box.minX), y0 = floorInt(box.minY), z0 = floorInt(box.minZ);
+    int x1 = static_cast<int>(std::ceil(box.maxX)) - 1, y1 = static_cast<int>(std::ceil(box.maxY)) - 1, z1 = static_cast<int>(std::ceil(box.maxZ)) - 1;
+    bool loaded = true; // hasFluidAndLoaded (the chunks around must be loaded)
+    for (int cx = (x0 - 1) >> 4; cx <= (x1 + 1) >> 4 && loaded; cx++)
+        for (int cz = (z0 - 1) >> 4; cz <= (z1 + 1) >> 4 && loaded; cz++) loaded = level.getChunkIfLoaded({cx, cz}) != nullptr;
+    bool any = false;
+    if (loaded) {
+        double eyeY = y + eyeHeight();
+        int eyeX = floorInt(x), eyeZ = floorInt(z);
+        for (int bx = x0; bx <= x1; bx++)
+            for (int by = y0; by <= y1; by++)
+                for (int bz = z0; bz <= z1; bz++) {
+                    if (by < level.minY() || by > level.maxY()) continue;
+                    BlockPos p{bx, by, bz};
+                    fluids::FluidState fluid = level.getFluidState(p);
+                    if (fluid.isEmpty()) continue;
+                    double bottom = by, top = bottom + fluids::height(level, p, fluid);
+                    if (top < box.minY) continue;
+                    any = true;
+                    int family = fluids::isLava(fluid.type) ? 1 : 0;
+                    if (bx == eyeX && bz == eyeZ && eyeY >= bottom) {
+                        // FluidState.getHeightForCamera: a source under a sturdy bottom face fills the block
+                        BlockStateId above = level.getBlockState(p.above());
+                        double cameraTop = fluid.isSource() && blocks::isFaceSturdy(above, Direction::Down) ? bottom + 1.0 : top;
+                        if (eyeY <= cameraTop) eyeInFluid_[family] = true;
+                    }
+                    typeHeight[fluid.type] = std::max(top - box.minY, typeHeight[fluid.type]);
+                    fluidHeight_[family] = std::max(fluidHeight_[family], typeHeight[fluid.type]);
+                    if (isPushedByFluid()) {
+                        auto flow = fluids::flow(level, p, fluid);
+                        Current& c = current[family];
+                        c.height = std::max(typeHeight[fluid.type], c.height);
+                        double scale = c.height < 0.4 ? c.height : 1.0;
+                        c.x += flow[0] * scale, c.y += flow[1] * scale, c.z += flow[2] * scale;
+                        c.count++;
+                    }
+                }
+    }
+    // Entity.updateFluidInteraction
+    bool inWater = fluidHeight_[0] > 0.0, inLava = fluidHeight_[1] > 0.0;
+    if (inWater && !wasTouchingWater_ && !firstTick_) doWaterSplashEffect(level);
+    wasTouchingWater_ = inWater;
+    auto applyCurrent = [&](const Current& c, double scale) { // CurrentAccumulator.applyTo (not a player)
+        if (c.count == 0 || c.x * c.x + c.y * c.y + c.z * c.z < 1.0e-5f) return;
+        double len = std::sqrt(c.x * c.x + c.y * c.y + c.z * c.z); // (normalize)
+        double ix = c.x / len * scale, iy = c.y / len * scale, iz = c.z / len * scale;
+        if (std::abs(vx) < 0.003 && std::abs(vz) < 0.003) {
+            double ilen = std::sqrt(ix * ix + iy * iy + iz * iz);
+            if (ilen < 0.0045000000000000005 && ilen >= 1.0e-5f) {
+                double k = 0.0045000000000000005 / ilen;
+                ix *= k, iy *= k, iz *= k;
+            } else if (ilen < 0.0045000000000000005) {
+                ix = iy = iz = 0;
+            }
+        }
+        vx += ix, vy += iy, vz += iz;
+    };
+    if (isPushedByFluid()) {
+        if (inWater) applyCurrent(current[0], 0.014);
+        if (inLava) applyCurrent(current[1], level.fastLava() ? 0.007 : 0.0023333333333333335);
+    }
+    return any;
+}
+
+void Entity::baseTick(ServerLevel& level) {
+    updateFluidInteraction(level);
+    if (remainingFireTicks > 0) {
+        if (fireImmune()) {
+            remainingFireTicks = std::min(0, remainingFireTicks); // clearFire
+        } else {
+            if (remainingFireTicks % 20 == 0 && !isInLava()) hurt(level, "minecraft:on_fire", 1.0f);
+            remainingFireTicks--;
+        }
+    }
+    if (y < level.minY() - 64) removed = true; // checkBelowWorld -> onBelowWorld
+    firstTick_ = false;
+}
+
+void Entity::applyEffectsFromBlocks(ServerLevel& level, double fx, double fy, double fz) {
+    if (removed || noPhysics) return; // isAffectedByBlocks
+    bool wasOnFire = isOnFire();
+    int fireTicksBefore = remainingFireTicks;
+    // checkInsideBlocks with the StepBasedCollector, as one step: what each block does, then the
+    // effects in InsideBlockEffectType order with the hurts registered after them.
+    bool fireIgnite = false, lavaIgnite = false, extinguish = false;
+    std::vector<float> fireHurts;
+    int lavaHurts = 0;
+    AABB box = boundingBox().inflate(-1.0e-5, -1.0e-5, -1.0e-5);
+    AABB from = box.move(fx - x, fy - y, fz - z);
+    AABB swept{std::min(box.minX, from.minX), std::min(box.minY, from.minY), std::min(box.minZ, from.minZ),
+               std::max(box.maxX, from.maxX), std::max(box.maxY, from.maxY), std::max(box.maxZ, from.maxZ)};
+    for (int bx = floorInt(swept.minX); bx <= floorInt(swept.maxX); bx++)
+        for (int by = std::max(level.minY(), floorInt(swept.minY)); by <= std::min(level.maxY(), floorInt(swept.maxY)); by++)
+            for (int bz = floorInt(swept.minZ); bz <= floorInt(swept.maxZ); bz++) {
+                BlockPos p{bx, by, bz};
+                BlockStateId state = level.getBlockState(p);
+                if (blocks::isAir(state)) continue;
+                uint32_t b = blocks::blockOf(state);
+                AABB blockBox{static_cast<double>(bx), static_cast<double>(by), static_cast<double>(bz), bx + 1.0, by + 1.0, bz + 1.0};
+                if (blocks::isInstance(b, "BaseFireBlock") && blockBox.intersects(swept)) { // BaseFireBlock.entityInside
+                    fireIgnite = true;
+                    fireHurts.push_back(b == gen::block::SOUL_FIRE ? 2.0f : 1.0f);
+                }
+                fluids::FluidState fluid = fluids::stateOf(state);
+                if (fluid.isEmpty()) continue;
+                AABB fluidBox{static_cast<double>(bx), static_cast<double>(by), static_cast<double>(bz), bx + 1.0, by + fluids::height(level, p, fluid), bz + 1.0};
+                if (!fluidBox.intersects(swept)) continue; // collidedWithFluid
+                if (fluids::isLava(fluid.type)) { // LavaFluid.entityInside
+                    lavaIgnite = true;
+                    lavaHurts++;
+                } else {
+                    extinguish = true; // WaterFluid.entityInside
+                }
+            }
+    auto& r = level.random();
+    if (fireIgnite && !fireImmune()) { // BaseFireBlock.fireIgnite
+        if (remainingFireTicks < 0) remainingFireTicks++;
+        if (remainingFireTicks >= 0 && remainingFireTicks < 160) remainingFireTicks = 160; // igniteForSeconds(8)
+    }
+    for (float damage : fireHurts)
+        if (!removed) hurt(level, "minecraft:in_fire", damage);
+    if (lavaIgnite && !removed && !fireImmune() && remainingFireTicks < 300) remainingFireTicks = 300; // lavaIgnite: igniteForSeconds(15)
+    for (int i = 0; i < lavaHurts && !removed; i++) { // Entity.lavaHurt
+        if (fireImmune()) break;
+        if (hurt(level, "minecraft:lava", 4.0f) && shouldPlayLavaHurtSound()) playSound(level, "minecraft:entity.generic.burn", 0.4f, 2.0f + nextFloat(r) * 0.4f);
+    }
+    if (extinguish && !removed) remainingFireTicks = std::min(0, remainingFireTicks); // clearFire
+    if (wasOnFire && !isOnFire()) playSound(level, "minecraft:entity.generic.extinguish_fire", 0.7f, 1.6f + (nextFloat(r) - nextFloat(r)) * 0.4f);
+    bool ignitedThisTick = remainingFireTicks > fireTicksBefore;
+    if (!isOnFire() && !ignitedThisTick) remainingFireTicks = -1; // -getFireImmuneTicks()
+    if (wasOnFire != isOnFire()) dataChanged = true; // (the shared on-fire flag)
+    if (isOnFire()) everOnFire = true;
 }
 
 } // namespace mc

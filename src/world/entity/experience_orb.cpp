@@ -61,12 +61,21 @@ void ExperienceOrb::award(ServerLevel& level, double x, double y, double z, int 
     }
 }
 
+bool ExperienceOrb::hurt(ServerLevel& level, std::string_view type, float amount) {
+    (void)level, (void)type;
+    if (removed) return false; // (isInvulnerableToBase)
+    health = static_cast<int>(health - amount);
+    if (health <= 0) removed = true;
+    return true;
+}
+
 void ExperienceOrb::tick(ServerLevel& level) {
+    bool wasOnFire = isOnFire();
+    baseTick(level); // (Entity.tick)
+    if (removed) return;
     AABB box = boundingBox();
     bool colliding = collides(level, box);
-    BlockStateId atEyes = level.getBlockState(static_cast<int>(std::floor(x)), static_cast<int>(std::floor(y + height() * 0.85)),
-                                              static_cast<int>(std::floor(z)));
-    if (blocks::flags(atEyes) & blocks::kWater) { // setUnderwaterMovement
+    if (isEyeInFluid(false)) { // setUnderwaterMovement
         vx *= 0.9900000095367432;
         vy = std::min(vy + 5.000000237487257E-4, 0.05999999865889549);
         vz *= 0.9900000095367432;
@@ -87,12 +96,16 @@ void ExperienceOrb::tick(ServerLevel& level) {
         needsSync = true;
     }
     double fallSpeed = vy;
+    double fromX = x, fromY = y, fromZ = z;
     move(level, vx, vy, vz);
+    applyEffectsFromBlocks(level, fromX, fromY, fromZ);
+    if (removed) return;
     float friction = kAirDrag;
     if (onGround) friction *= blocks::behaviour(blocks::blockOf(level.getBlockState(onPos(0.999999f)))).friction;
     vx *= friction, vy *= friction, vz *= friction;
     if (verticalCollisionBelow && fallSpeed < -kGravity) vy = -fallSpeed * 0.4;
     if (++age >= kLifetime) removed = true;
+    if (wasOnFire != isOnFire()) dataChanged = true;
 }
 
 void ExperienceOrb::followNearbyPlayer(ServerLevel& level) {
@@ -158,6 +171,7 @@ int ExperienceOrb::repairPlayerItems(ServerLevel& level, ServerPlayer& player, i
 }
 
 bool ExperienceOrb::writeEntityData(ByteWriter& out) const {
+    writeSharedFlags(out);
     out.writeByte(8);
     out.writeVarInt(1); // EntityDataSerializers.INT
     out.writeVarInt(value);

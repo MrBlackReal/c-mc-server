@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string_view>
@@ -73,6 +74,9 @@ int tickDelay(ServerLevel& level, uint8_t type);
 // FluidState.getHeight / getOwnHeight
 float ownHeight(FluidState fluid);
 float height(ServerLevel& level, BlockPos pos, FluidState fluid);
+
+// FlowingFluid.getFlow: the (normalized) direction the fluid at `pos` pushes entities in.
+std::array<double, 3> flow(ServerLevel& level, BlockPos pos, FluidState fluid);
 
 // FlowingFluid.tick: a scheduled fluid tick at `pos` for the fluid that's there.
 void tick(ServerLevel& level, BlockPos pos, BlockStateId state, FluidState fluid);
