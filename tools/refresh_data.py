@@ -162,7 +162,7 @@ def run_extractor(java, server_dir, work, version_id):
     javac = os.path.join(os.path.dirname(java), "javac") if os.path.dirname(java) else "javac"
     classes = os.path.join(work, "extractor")
     subprocess.run([javac, "-nowarn", "-cp", cp, "-d", classes, os.path.join(ROOT, "tools", "extractor", "Extractor.java")], check=True)
-    subprocess.run([java, "-cp", classes + os.pathsep + cp, "Extractor", os.path.join(DATA, "extracted.json")],
+    subprocess.run([java, "-cp", classes + os.pathsep + cp, "Extractor", os.path.join(DATA, "extracted.json"), os.path.join(DATA, "vanilla_config.json")],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -218,8 +218,6 @@ def main():
         finally:
             proc.communicate(b"stop\n", timeout=60)
 
-        run_extractor(a.java, srv, work, version["id"])
-
         d = json.load(open(dump))
         out = {
             "known_packs": [["minecraft", "core", version["id"]]],
@@ -229,6 +227,7 @@ def main():
         }
         with open(os.path.join(DATA, "vanilla_config.json"), "w") as f:
             json.dump(out, f, separators=(",", ":"))
+        run_extractor(a.java, srv, work, version["id"])  # (binds the tags from vanilla_config.json)
         pack_registry_elements(jar)
     finally:
         shutil.rmtree(work, ignore_errors=True)

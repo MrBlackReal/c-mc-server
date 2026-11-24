@@ -59,8 +59,13 @@ void ServerGamePacketListener::tick() {
     }
 }
 
-void ServerGamePacketListener::teleport(double x, double y, double z, float yRot, float xRot) {
-    player_.x = x, player_.y = y, player_.z = z, player_.yRot = yRot, player_.xRot = xRot;
+void ServerGamePacketListener::teleport(double x, double y, double z, float yRot, float xRot, int relatives) {
+    // PositionMoveRotation.calculateAbsolute (Relative: X 1, Y 2, Z 4, Y_ROT 8, X_ROT 16)
+    player_.x = relatives & 1 ? player_.x + x : x;
+    player_.y = relatives & 2 ? player_.y + y : y;
+    player_.z = relatives & 4 ? player_.z + z : z;
+    player_.yRot = relatives & 8 ? player_.yRot + yRot : yRot;
+    player_.xRot = relatives & 16 ? player_.xRot + xRot : xRot;
     if (++teleportId_ == INT32_MAX) teleportId_ = 0;
     awaitingTeleport_ = teleportId_;
     awaitingTeleportTime_ = listenerTicks_;
@@ -74,7 +79,7 @@ void ServerGamePacketListener::teleport(double x, double y, double z, float yRot
     p.writeDouble(0);
     p.writeFloat(yRot);
     p.writeFloat(xRot);
-    p.writeInt(0); // no relative components
+    p.writeInt(relatives);
     conn_.send(p);
 }
 
@@ -93,7 +98,8 @@ void ServerGamePacketListener::sendAbilities() {
     conn_.send(p);
 }
 
-void ServerGamePacketListener::setGameMode(GameType mode) {
+bool ServerGamePacketListener::setGameMode(GameType mode) {
+    if (player_.gameMode == mode) return false;
     player_.gameMode = mode;
     Packet event(cb::GAME_EVENT);
     event.writeByte(3); // CHANGE_GAME_MODE
@@ -106,6 +112,7 @@ void ServerGamePacketListener::setGameMode(GameType mode) {
     info.writeUUID(player_.profile().id);
     info.writeVarInt(static_cast<int>(mode));
     server_.playerList().broadcastAll(info);
+    return true;
 }
 
 void ServerGamePacketListener::sendSystemMessage(const Component& message) {
@@ -278,6 +285,7 @@ void ServerGamePacketListener::handlePacket(int id, ByteReader& in) {
         break;
     }
     case sb::CHAT_COMMAND_SIGNED: handleSignedCommand(in); break;
+    case sb::COMMAND_SUGGESTION: handleCommandSuggestion(in); break;
     case sb::CHAT_SESSION_UPDATE: handleChatSessionUpdate(in); break;
     case sb::CHAT_ACK: handleChatAck(in); break;
     case sb::PLAYER_LOADED:
@@ -288,12 +296,7 @@ void ServerGamePacketListener::handlePacket(int id, ByteReader& in) {
     case sb::PLAYER_ACTION: handlePlayerAction(in); break;
     case sb::USE_ITEM_ON: handleUseItemOn(in); break;
     case sb::SIGN_UPDATE: handleSignUpdate(in); break;
-    case sb::USE_ITEM: {
-        in.readVarInt(); // hand
-        ackBlockChangesUpTo(in.readVarInt());
-        // TODO: using items in the air (food, bows, buckets, ...)
-        break;
-    }
+    case sb::USE_ITEM: handleUseItem(in); break;
     case sb::SET_CREATIVE_MODE_SLOT: handleSetCreativeModeSlot(in); break;
     case sb::SET_CARRIED_ITEM: handleSetCarriedItem(in); break;
     case sb::PICK_ITEM_FROM_BLOCK: handlePickItemFromBlock(in); break;

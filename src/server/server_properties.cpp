@@ -1,5 +1,6 @@
 #include "server/server_properties.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <fstream>
 
@@ -92,6 +93,9 @@ ServerProperties ServerProperties::load(const std::filesystem::path& path) {
     b.str("level-type", p.levelType);
     b.boolean("sync-chunk-writes", p.syncChunkWrites);
     b.str("region-file-compression", p.regionFileCompression);
+    b.integer("op-permission-level", p.opPermissionLevel);
+    p.opPermissionLevel = std::clamp(p.opPermissionLevel, 0, 4);
+    b.boolean("broadcast-console-to-ops", p.broadcastConsoleToOps);
     return p;
 }
 

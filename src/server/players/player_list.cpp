@@ -124,7 +124,36 @@ void PlayerList::sendAddEntity(Connection& to, const ServerPlayer& e) {
     to.send(p);
 }
 
+void PlayerList::loadOps() {
+    try {
+        ops_.load();
+    } catch (const std::exception& e) {
+        log::warn("Failed to load operators list: {}", e.what());
+    }
+}
+
+void PlayerList::op(const NameAndId& user) {
+    const ServerOpList::Entry* old = ops_.get(user.id);
+    ops_.add({user, server_.properties().opPermissionLevel, old && old->bypassesPlayerLimit});
+    if (ServerPlayer* p = getPlayer(user.id)) sendPlayerPermissionLevel(*p);
+}
+
+void PlayerList::deop(const NameAndId& user) {
+    if (!ops_.remove(user.id)) return;
+    if (ServerPlayer* p = getPlayer(user.id)) sendPlayerPermissionLevel(*p);
+}
+
+void PlayerList::sendPlayerPermissionLevel(ServerPlayer& player) {
+    // ClientboundEntityEventPacket: 24 + the level (PERMISSION_LEVEL_ALL ... OWNERS)
+    Packet ev(pk::ENTITY_EVENT);
+    ev.writeInt(player.id());
+    ev.writeByte(static_cast<uint8_t>(24 + server_.getProfilePermissions(player.profile().id)));
+    player.connection().send(ev);
+    server_.commands().sendCommands(player);
+}
+
 void PlayerList::placeNewPlayer(Connection& conn, GameProfile profile, ClientInformation info) {
+    server_.nameToIdCache().add({profile.id, profile.name});
     ServerLevel& level = server_.overworld();
     const auto& props = server_.properties();
     auto owned = std::make_unique<ServerPlayer>(server_.nextEntityId(), std::move(profile), level, conn, std::move(info));
@@ -175,7 +204,6 @@ void PlayerList::placeNewPlayer(Connection& conn, GameProfile profile, ClientInf
     difficulty.writeBool(false);
     conn.send(difficulty);
 
-    commands::sendCommandTree(conn);
     game->sendAbilities();
 
     Packet held(pk::SET_HELD_SLOT);
@@ -185,6 +213,7 @@ void PlayerList::placeNewPlayer(Connection& conn, GameProfile profile, ClientInf
     Packet recipes(pk::UPDATE_RECIPES);
     recipes::writeUpdateRecipes(recipes);
     conn.send(recipes);
+    sendPlayerPermissionLevel(player);
 
     game->teleport(player.x, player.y, player.z, player.yRot, player.xRot);
 

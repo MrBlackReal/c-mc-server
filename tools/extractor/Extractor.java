@@ -29,9 +29,25 @@ import net.minecraft.world.level.material.Fluids;
 
 public class Extractor {
     static int offGridFaces = 0;
+    // Binds the block tags recorded from the vanilla server (vanilla_config.json, ids expanded):
+    // some behaviour reads them (fluids: minecraft:washed_away_by_fluids, blocks_fluid_flow).
+    static void bindBlockTags(String vanillaConfig) throws Exception {
+        var root = com.google.gson.JsonParser.parseReader(new java.io.FileReader(vanillaConfig)).getAsJsonObject();
+        var tags = root.getAsJsonObject("tags").getAsJsonObject("minecraft:block");
+        java.util.Map<Integer, java.util.List<net.minecraft.tags.TagKey<Block>>> byBlock = new java.util.HashMap<>();
+        for (var e : tags.entrySet()) {
+            var key = net.minecraft.tags.TagKey.create(net.minecraft.core.registries.Registries.BLOCK, net.minecraft.resources.Identifier.parse(e.getKey()));
+            for (var id : e.getValue().getAsJsonArray()) byBlock.computeIfAbsent(id.getAsInt(), k -> new java.util.ArrayList<>()).add(key);
+        }
+        var bind = net.minecraft.core.Holder.Reference.class.getDeclaredMethod("bindTags", java.util.Collection.class);
+        bind.setAccessible(true);
+        for (Block b : BuiltInRegistries.BLOCK)
+            bind.invoke(BuiltInRegistries.BLOCK.wrapAsHolder(b), byBlock.getOrDefault(BuiltInRegistries.BLOCK.getId(b), java.util.List.of()));
+    }
     public static void main(String[] args) throws Exception {
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
+        bindBlockTags(args[1]);
         JsonObject root = new JsonObject();
         EmptyBlockGetter level = EmptyBlockGetter.INSTANCE;
         BlockPos pos = BlockPos.ZERO;
@@ -44,7 +60,18 @@ public class Extractor {
         java.util.Map<String, Integer> shapeIndex = new java.util.HashMap<>();
         JsonArray faceMasks = new JsonArray();
         JsonArray stateFaces = new JsonArray();
+        JsonArray stateFluids = new JsonArray();
+        JsonArray outlineShapes = new JsonArray(), stateOutline = new JsonArray();
+        java.util.Map<String, Integer> outlineIndex = new java.util.HashMap<>();
         java.util.Map<String, Integer> faceIndex = new java.util.HashMap<>();
+        net.minecraft.world.level.material.Fluid[] fluidTypes = {Fluids.FLOWING_WATER, Fluids.WATER, Fluids.FLOWING_LAVA, Fluids.LAVA};
+        Class<?> FF = net.minecraft.world.level.material.FlowingFluid.class;
+        Class<?> BG = net.minecraft.world.level.BlockGetter.class, FL = net.minecraft.world.level.material.Fluid.class;
+        var canHoldAnyFluid = FF.getDeclaredMethod("canHoldAnyFluid", BlockState.class);
+        var canHoldFluid = FF.getDeclaredMethod("canHoldFluid", BG, BlockPos.class, BlockState.class, FL);
+        var canHoldSpecificFluid = FF.getDeclaredMethod("canHoldSpecificFluid", BG, BlockPos.class, BlockState.class, FL);
+        for (var m : new java.lang.reflect.Method[]{canHoldAnyFluid, canHoldFluid, canHoldSpecificFluid}) m.setAccessible(true);
+        java.util.List<BlockState> shapeReps = new java.util.ArrayList<>();
         for (BlockState state : Block.BLOCK_STATE_REGISTRY) {
             int flags = 0;
             if (state.isAir()) flags |= 1;
@@ -73,6 +100,25 @@ public class Extractor {
             if (state.useShapeForLightOcclusion()) flags |= 1 << 30;
             if (fluid.isRandomlyTicking()) flags |= 1 << 31;
             states.add(flags);
+            // The state's fluid and how fluids treat the block (FlowingFluid, BucketItem), see
+            // FluidInfo in fluids.hpp: type (minecraft:fluid id), amount, falling, blocksMotion,
+            // collision shape is Shapes.block(), LiquidBlockContainer, BucketPickup,
+            // canPlaceLiquid and canBeReplaced per fluid, SimpleWaterloggedBlock.
+            int fl = BuiltInRegistries.FLUID.getId(fluid.getType()) | fluid.getAmount() << 3;
+            if (!fluid.isEmpty() && fluid.getValue(net.minecraft.world.level.material.FlowingFluid.FALLING)) fl |= 1 << 7;
+            if ((boolean) canHoldAnyFluid.invoke(null, state)) fl |= 1 << 8;
+            if (collision == net.minecraft.world.phys.shapes.Shapes.block()) fl |= 1 << 9;
+            Block blk = state.getBlock();
+            if (blk instanceof net.minecraft.world.level.block.LiquidBlockContainer) fl |= 1 << 10;
+            if (blk instanceof net.minecraft.world.level.block.BucketPickup) fl |= 1 << 11;
+            for (int i = 0; i < 4; i++) {
+                if (blk instanceof net.minecraft.world.level.block.LiquidBlockContainer c && c.canPlaceLiquid(null, level, pos, state, fluidTypes[i])) fl |= 1 << (12 + i);
+                if (state.canBeReplaced(fluidTypes[i])) fl |= 1 << (16 + i);
+                if ((boolean) canHoldFluid.invoke(null, level, pos, state, fluidTypes[i])) fl |= 1 << (21 + i);
+                if ((boolean) canHoldSpecificFluid.invoke(null, level, pos, state, fluidTypes[i])) fl |= 1 << (25 + i);
+            }
+            if (blk instanceof net.minecraft.world.level.block.SimpleWaterloggedBlock) fl |= 1 << 20;
+            stateFluids.add(fl);
             // Light occlusion faces (LightEngine.getOcclusionShape) as 16x16 masks, for states whose
             // shape matters (canOcclude and useShapeForLightOcclusion); deduplicated like shapes.
             int faceIdx = -1;
@@ -122,12 +168,89 @@ public class Extractor {
                 shapes.add(boxes);
             }
             stateShapes.add(idx);
+            if (idx == shapeReps.size()) shapeReps.add(state);
+            // Outline shapes (BlockState.getShape, empty context: what ClipContext.Block.OUTLINE hits).
+            JsonArray outline = new JsonArray();
+            for (AABB b : state.getShape(level, pos).toAabbs()) {
+                JsonArray box = new JsonArray();
+                box.add(b.minX); box.add(b.minY); box.add(b.minZ); box.add(b.maxX); box.add(b.maxY); box.add(b.maxZ);
+                outline.add(box);
+            }
+            Integer oi = outlineIndex.get(outline.toString());
+            if (oi == null) {
+                oi = outlineShapes.size();
+                outlineIndex.put(outline.toString(), oi);
+                outlineShapes.add(outline);
+            }
+            stateOutline.add(oi);
         }
+        // Shapes.mergedFaceOccludes for every pair of collision shapes (a * count + b), a bit per
+        // Direction (3D data value): what FlowingFluid.canPassThroughWall decides with.
+        JsonArray faceOccludes = new JsonArray();
+        for (BlockState a : shapeReps)
+            for (BlockState b : shapeReps) {
+                int mask = 0;
+                for (Direction d : Direction.values())
+                    if (net.minecraft.world.phys.shapes.Shapes.mergedFaceOccludes(a.getCollisionShape(level, pos), b.getCollisionShape(level, pos), d))
+                        mask |= 1 << d.get3DDataValue();
+                faceOccludes.add(mask);
+            }
+        root.add("shape_face_occludes", faceOccludes);
+        // Check canPassThroughWall against the way fluids.cpp rebuilds it from the table.
+        var canPassThroughWall = net.minecraft.world.level.material.FlowingFluid.class.getDeclaredMethod("canPassThroughWall",
+            Direction.class, net.minecraft.world.level.BlockGetter.class, BlockPos.class, BlockState.class, BlockPos.class, BlockState.class);
+        canPassThroughWall.setAccessible(true);
+        java.util.List<BlockState> allStates = new java.util.ArrayList<>();
+        Block.BLOCK_STATE_REGISTRY.forEach(allStates::add);
+        java.util.Random random = new java.util.Random(1);
+        int wallMismatches = 0;
+        for (int i = 0; i < 400000; i++) {
+            BlockState a = i < 200000 ? shapeReps.get(random.nextInt(shapeReps.size())) : allStates.get(random.nextInt(allStates.size()));
+            BlockState b = i < 200000 ? shapeReps.get(random.nextInt(shapeReps.size())) : allStates.get(random.nextInt(allStates.size()));
+            Direction d = Direction.values()[random.nextInt(6)];
+            boolean vanilla = (boolean) canPassThroughWall.invoke(null, d, level, pos, a, pos.relative(d), b);
+            var sa = a.getCollisionShape(level, pos);
+            var sb = b.getCollisionShape(level, pos);
+            boolean ours = sb != net.minecraft.world.phys.shapes.Shapes.block() && sa != net.minecraft.world.phys.shapes.Shapes.block()
+                && ((sa.isEmpty() && sb.isEmpty()) || !net.minecraft.world.phys.shapes.Shapes.mergedFaceOccludes(sa, sb, d));
+            if (vanilla != ours) wallMismatches++;
+        }
+        if (wallMismatches > 0) System.err.println("WARNING: canPassThroughWall differs from fluids.cpp's rebuild in " + wallMismatches + " samples");
+        // And how fluids.cpp combines the recorded predicates (FlowingFluid.canMaybePassThrough,
+        // canPassThrough, isWaterHole), for water and lava.
+        var canMaybePassThrough = FF.getDeclaredMethod("canMaybePassThrough", BG, BlockPos.class, BlockState.class, Direction.class, BlockPos.class, BlockState.class,
+            net.minecraft.world.level.material.FluidState.class);
+        var canPassThrough = FF.getDeclaredMethod("canPassThrough", BG, FL, BlockPos.class, BlockState.class, Direction.class, BlockPos.class, BlockState.class,
+            net.minecraft.world.level.material.FluidState.class);
+        var isWaterHole = FF.getDeclaredMethod("isWaterHole", BG, BlockPos.class, BlockState.class, BlockPos.class, BlockState.class);
+        for (var m : new java.lang.reflect.Method[]{canMaybePassThrough, canPassThrough, isWaterHole}) m.setAccessible(true);
+        int ruleMismatches = 0;
+        for (int i = 0; i < 400000; i++) {
+            BlockState a = allStates.get(random.nextInt(allStates.size())), b = allStates.get(random.nextInt(allStates.size()));
+            if (i % 2 == 0) a = random.nextBoolean() ? net.minecraft.world.level.block.Blocks.WATER.defaultBlockState() : net.minecraft.world.level.block.Blocks.LAVA.defaultBlockState();
+            Direction d = Direction.values()[random.nextInt(6)];
+            var self = (net.minecraft.world.level.material.FlowingFluid) (random.nextBoolean() ? Fluids.WATER : Fluids.LAVA);
+            var flowing = self.getFlowing();
+            boolean wall = (boolean) canPassThroughWall.invoke(null, d, level, pos, a, pos.relative(d), b);
+            var bf = b.getFluidState();
+            boolean sourceOfThis = bf.getType().isSame(self) && bf.isSource();
+            boolean maybe = !sourceOfThis && (boolean) canHoldAnyFluid.invoke(null, b) && wall;
+            if (maybe != (boolean) canMaybePassThrough.invoke(self, level, pos, a, d, pos.relative(d), b, bf)) ruleMismatches++;
+            boolean passOurs = maybe && (boolean) canHoldSpecificFluid.invoke(null, level, pos.relative(d), b, flowing);
+            if (passOurs != (boolean) canPassThrough.invoke(self, level, flowing, pos, a, d, pos.relative(d), b, bf)) ruleMismatches++;
+            boolean downWall = (boolean) canPassThroughWall.invoke(null, Direction.DOWN, level, pos, a, pos.below(), b);
+            boolean holeOurs = downWall && (bf.getType().isSame(self) || (boolean) canHoldFluid.invoke(null, level, pos.below(), b, flowing));
+            if (holeOurs != (boolean) isWaterHole.invoke(self, level, pos, a, pos.below(), b)) ruleMismatches++;
+        }
+        if (ruleMismatches > 0) System.err.println("WARNING: fluid pass-through rules differ from fluids.cpp's rebuild in " + ruleMismatches + " samples");
         root.add("state_flags", states);
         root.add("shapes", shapes);
         root.add("state_shape", stateShapes);
         root.add("face_masks", faceMasks);
         root.add("state_faces", stateFaces);
+        root.add("state_fluid", stateFluids);
+        root.add("outline_shapes", outlineShapes);
+        root.add("state_outline", stateOutline);
         if (offGridFaces > 0) System.err.println("WARNING: " + offGridFaces + " light face coordinates off the 1/16 grid");
 
         JsonObject blocks = new JsonObject();

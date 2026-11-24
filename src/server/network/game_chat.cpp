@@ -6,6 +6,7 @@
 #include "server/commands/commands.hpp"
 #include "server/minecraft_server.hpp"
 #include "server/network/listeners.hpp"
+#include "server/commands/brigadier.hpp"
 #include "util/log.hpp"
 
 namespace mc {
@@ -102,9 +103,9 @@ void ServerGamePacketListener::handleSignedCommand(ByteReader& in) {
     auto lastSeen = unpackAndApplyLastSeen(update);
     if (!lastSeen || !tryHandleChat(command, true)) return;
 
-    // SignableCommand: the arguments of type minecraft:message. TODO: Brigadier; so far /say's.
-    std::vector<std::pair<std::string, std::string>> signable;
-    if (command.starts_with("say ")) signable.emplace_back("message", command.substr(4));
+    // SignableCommand.of(parseCommand(command)): the arguments of type minecraft:message.
+    auto source = commands::CommandSourceStack::forPlayer(server_, player_);
+    auto signable = commands::Commands::signableArguments(server_.commands().parse(command, source));
 
     std::map<std::string, chat::PlayerChatMessage> signedArguments; // collectSignedArguments
     std::string failure;
@@ -137,13 +138,62 @@ void ServerGamePacketListener::handleSignedCommand(ByteReader& in) {
 
 void ServerGamePacketListener::handleCommand(const std::string& command, const std::map<std::string, chat::PlayerChatMessage>* signedArguments) {
     log::info("{} issued server command: /{}", player_.profile().name, command);
+    auto source = commands::CommandSourceStack::forPlayer(server_, player_);
+    auto& commands = server_.commands();
+    if (signedArguments) { // performSignedChatCommand: withSigningContext(SignedArguments)
+        source.signedArguments = std::make_shared<const std::map<std::string, chat::PlayerChatMessage>>(*signedArguments);
+        commands.performCommand(commands.parse(command, source), command);
+        return;
+    }
     // performUnsignedChatCommand: with secure chat enforced, commands with message arguments must be signed.
-    if (!signedArguments && server_.enforceSecureProfile() && command.starts_with("say ")) {
+    auto parsed = commands.parse(command, source);
+    if (server_.enforceSecureProfile() && !commands::Commands::signableArguments(parsed).empty()) {
         log::error("Received unsigned command packet from {}, but the command requires signable arguments: {}", player_.profile().name, command);
         sendSystemMessage(Component::translatable("chat.disabled.invalid_command_signature").withColor("red"));
         return;
     }
-    commands::execute({server_, this, signedArguments}, command);
+    commands.performCommand(parsed, command);
+}
+
+void ServerGamePacketListener::handleCommandSuggestion(ByteReader& in) {
+    // ServerboundCommandSuggestionPacket -> ClientboundCommandSuggestionsPacket
+    int id = in.readVarInt();
+    std::string command = in.readUtf(32500);
+    commands::brigadier::StringReader reader(command);
+    if (reader.canRead() && reader.peek() == '/') reader.skip();
+    auto& dispatcher = server_.commands().dispatcher();
+    auto parse = dispatcher.parse(reader, std::make_shared<const commands::CommandSourceStack>(commands::CommandSourceStack::forPlayer(server_, player_)));
+    commands::brigadier::Suggestions suggestions = dispatcher.getCompletionSuggestions(parse);
+    if (suggestions.list.size() > 1000) suggestions.list.resize(1000);
+    // (offsets are UTF-16 units on the wire; ours are bytes of the UTF-8 text)
+    auto utf16 = [&](int byteOffset) {
+        int units = 0;
+        for (int i = 0; i < byteOffset && i < static_cast<int>(command.size()); i++) {
+            auto c = static_cast<unsigned char>(command[i]);
+            if ((c & 0xC0) != 0x80) units += c >= 0xF0 ? 2 : 1;
+        }
+        return units;
+    };
+    Packet p(cb::COMMAND_SUGGESTIONS);
+    p.writeVarInt(id);
+    int start = utf16(suggestions.range.start);
+    p.writeVarInt(start);
+    p.writeVarInt(utf16(suggestions.range.end) - start);
+    p.writeVarInt(static_cast<int32_t>(suggestions.list.size()));
+    for (const auto& s : suggestions.list) {
+        p.writeUtf(s.text);
+        p.writeBool(s.tooltip.has_value());
+        if (s.tooltip) nbt::writeNetwork(p, s.tooltip->toNbt());
+    }
+    conn_.send(p);
+}
+
+void ServerGamePacketListener::sendChatMessage(const chat::PlayerChatMessage& message, const chat::ChatTypeBound& chatType) {
+    // ServerPlayer.sendChatMessage(OutgoingChatMessage.create(message), ...): disguised from the
+    // server, else player chat; only if the player's chat is visible (ChatVisiblity.FULL).
+    if (player_.clientInfo.chatVisibility != 0) return;
+    if (message.isSystem()) sendDisguisedChatMessage(message.decoratedContent(), chatType);
+    else sendPlayerChatMessage(message, chatType);
 }
 
 void ServerGamePacketListener::handleChatSessionUpdate(ByteReader& in) {

@@ -2,6 +2,8 @@
 #include "world/level/block/block_behaviour_internal.hpp"
 
 #include <algorithm>
+#include <deque>
+#include <unordered_set>
 #include <cmath>
 #include <random>
 #include <string>
@@ -9,6 +11,7 @@
 #include "core/registries.hpp"
 #include "generated/behaviour.hpp"
 #include "server/level/server_level.hpp"
+#include "world/level/material/fluids.hpp"
 #include "util/json.hpp"
 #include "world/entity/falling_block_entity.hpp"
 #include "world/item/item_logic.hpp"
@@ -1158,6 +1161,7 @@ BlockStateId fireWithAge(ServerLevel& level, BlockPos pos, int age);
 
 bool canSurvive(BlockStateId s, ServerLevel& level, BlockPos pos) {
     uint32_t b = bs::blockOf(s);
+    if (b == BUBBLE_COLUMN) return fluids::bubbleColumnCanSurvive(level, pos);
     BlockPos below = pos.below(), above = pos.above();
     BlockStateId belowState = level.getBlockState(below);
     BlockStateId aboveState = level.getBlockState(above);
@@ -1387,8 +1391,26 @@ BlockStateId growingPlantShape(BlockStateId s, ServerLevel& level, BlockPos pos,
 }
 } // namespace
 
+namespace {
+BlockStateId updateShapeOwn(BlockStateId s, ServerLevel& level, BlockPos pos, Direction toNeighbour, BlockPos neighbourPos, BlockStateId neighbour);
+} // namespace
+
 BlockStateId updateShape(BlockStateId s, ServerLevel& level, BlockPos pos, Direction toNeighbour, BlockPos neighbourPos,
                          BlockStateId neighbour) {
+    // The fluid part: most blocks holding water schedule it first thing; these only if they survive.
+    uint32_t b = bs::blockOf(s);
+    bool scheduleAfter = b == SEAGRASS || b == BIG_DRIPLEAF || b == LADDER || b == HANGING_ROOTS || b == SEA_PICKLE;
+    bool kelpConverts = (b == KELP && toNeighbour == Direction::Up && (bs::is(neighbour, KELP) || bs::is(neighbour, KELP_PLANT))) ||
+                        (b == KELP_PLANT && toNeighbour == Direction::Up && !bs::is(neighbour, KELP) && !bs::is(neighbour, KELP_PLANT));
+    if (!scheduleAfter && !kelpConverts && b != TALL_SEAGRASS) fluids::scheduleOnShapeUpdate(level, pos, s, toNeighbour, neighbour);
+    if (b == BUBBLE_COLUMN) fluids::bubbleColumnShapeUpdate(level, pos, s, toNeighbour, neighbour);
+    BlockStateId result = updateShapeOwn(s, level, pos, toNeighbour, neighbourPos, neighbour);
+    if (scheduleAfter && !bs::isAir(result)) fluids::scheduleOnShapeUpdate(level, pos, s, toNeighbour, neighbour);
+    return result;
+}
+
+namespace {
+BlockStateId updateShapeOwn(BlockStateId s, ServerLevel& level, BlockPos pos, Direction toNeighbour, BlockPos neighbourPos, BlockStateId neighbour) {
     uint32_t b = bs::blockOf(s);
     BlockStateId air = bs::defaultState(AIR);
 
@@ -1571,6 +1593,7 @@ BlockStateId updateShape(BlockStateId s, ServerLevel& level, BlockPos pos, Direc
     if (needsSupport(b) && !canSurvive(s, level, pos)) return air;
     return s;
 }
+} // namespace
 
 void updateIndirectNeighbourShapes(ServerLevel& level, BlockPos pos, BlockStateId s, int flags, int depth) {
     if (!isA(s, "RedstoneWireBlock", 0)) return;
@@ -1713,8 +1736,58 @@ void onBrokenAfterFall(ServerLevel& level, BlockPos pos, BlockStateId state) {
     if (isA(bs::blockOf(state), "AnvilBlock")) level.levelEvent(1029, pos, 0);
 }
 
+namespace {
+// SpongeBlock.tryAbsorbWater / removeWaterBreadthFirstSearch (BlockPos.breadthFirstTraversal,
+// depth 6, at most 65 positions): water around the sponge goes, and it turns wet.
+void spongeTryAbsorbWater(ServerLevel& level, BlockPos start) {
+    std::deque<std::pair<BlockPos, int>> nodes{{start, 0}};
+    std::unordered_set<int64_t> visited;
+    int count = 0;
+    auto process = [&](BlockPos pos) {
+        if (pos == start) return true;
+        BlockStateId state = level.getBlockState(pos);
+        if (!fluids::isWater(fluids::stateOf(state).type)) return false;
+        if (fluids::info::isBucketPickup(state) && fluids::pickupBlock(level, pos, state)) return true;
+        uint32_t b = bs::blockOf(state);
+        if (isA(b, "LiquidBlock")) {
+            level.setBlock(pos, bs::defaultState(AIR));
+        } else {
+            if (b != KELP && b != KELP_PLANT && b != SEAGRASS && b != TALL_SEAGRASS) return false;
+            level.dropResources(state, pos, nullptr, nullptr, nullptr);
+            level.setBlock(pos, bs::defaultState(AIR));
+        }
+        return true;
+    };
+    while (!nodes.empty()) {
+        auto [pos, depth] = nodes.front();
+        nodes.pop_front();
+        if (!visited.insert(pos.asLong()).second) continue;
+        if (pos.y < level.minY() || pos.y > level.maxY() || !process(pos)) continue; // SKIP
+        if (++count >= 65) break;
+        if (depth < 6)
+            for (int d = 0; d < 6; d++) nodes.emplace_back(pos.relative(static_cast<Direction>(d)), depth + 1);
+    }
+    if (count > 1) {
+        level.setBlock(start, bs::defaultState(WET_SPONGE), ServerLevel::kUpdateClients);
+        level.playBlockSound(-1, start, registries::id("minecraft:sound_event", "minecraft:block.sponge.absorb").value_or(-1), 1.0f, 1.0f);
+    }
+}
+} // namespace
+
+bool isRedstoneWire(BlockStateId state) { return isA(state, "RedstoneWireBlock", 0); }
+
+void neighborChanged(ServerLevel& level, BlockPos pos, BlockStateId state, uint32_t sourceBlock) {
+    (void)sourceBlock;
+    uint32_t b = bs::blockOf(state);
+    if (isA(b, "LiquidBlock")) return fluids::liquidNeighborChanged(level, pos, state);
+    if (b == SPONGE) return spongeTryAbsorbWater(level, pos);
+    // TODO: redstone components (doors, trapdoors, gates, note blocks, rails, TNT, ...), frosted ice
+}
+
 void onPlace(ServerLevel& level, BlockPos pos, BlockStateId state, BlockStateId old) {
     uint32_t b = bs::blockOf(state);
+    if (isA(b, "LiquidBlock")) return fluids::liquidOnPlace(level, pos, state);
+    if (b == SPONGE && bs::blockOf(old) != b) return spongeTryAbsorbWater(level, pos);
     if (isA(b, "FallingBlock")) level.scheduleTick(pos, b, fallDelay(b));
     if (isA(b, "FrostedIceBlock")) level.scheduleTick(pos, b, level.levelRandom().nextInt(61) + 60); // Mth.nextInt(60, 120)
     if (isA(b, "BaseFireBlock")) {
@@ -1735,12 +1808,15 @@ BlockStateId updateFromNeighbourShapes(BlockStateId state, ServerLevel& level, B
 }
 
 bool hasTick(uint32_t block) {
-    return isA(block, "ComposterBlock") || block == FIRE || isA(block, "FallingBlock") || isA(block, "LecternBlock") || detail::hasPlantTick(block);
+    return isA(block, "ComposterBlock") || block == FIRE || isA(block, "FallingBlock") || isA(block, "LecternBlock") || isA(block, "LiquidBlock") ||
+           block == BUBBLE_COLUMN || detail::hasPlantTick(block);
 }
 
 void tick(ServerLevel& level, BlockPos pos, BlockStateId s) {
     uint32_t b = bs::blockOf(s);
     if (detail::plantTick(level, pos, s)) return;
+    if (isA(b, "LiquidBlock")) return fluids::liquidTick(level, pos, s);
+    if (b == BUBBLE_COLUMN) return fluids::bubbleColumnTick(level, pos, s);
     if (b == FIRE) return fireTick(level, pos, s);
     if (isA(b, "FallingBlock")) { // FallingBlock.tick: nothing below any more
         BlockStateId below = level.getBlockState(pos.below());

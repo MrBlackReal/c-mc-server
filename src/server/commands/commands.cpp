@@ -303,6 +303,11 @@ NodeBuilder setBlockCommand() {
 
 // ---------------------------------------------------------------- teleport
 
+// Level.isInSpawnableBounds
+bool inSpawnableBoundsCheck(BlockPos pos) {
+    return !(pos.y < -20000000 || pos.y >= 20000000) && pos.x >= -30000000 && pos.z >= -30000000 && pos.x < 30000000 && pos.z < 30000000;
+}
+
 // Relative (ClientboundPlayerPositionPacket flags)
 enum Relative : int { RelX = 1 << 0, RelY = 1 << 1, RelZ = 1 << 2, RelYRot = 1 << 3, RelXRot = 1 << 4, RelDeltaX = 1 << 5, RelDeltaY = 1 << 6, RelDeltaZ = 1 << 7 };
 
@@ -695,11 +700,6 @@ int listPlayers(const CommandSourceStack& source, bool uuids) {
 
 } // namespace
 
-// Level.isInSpawnableBounds (used by teleport)
-bool inSpawnableBoundsCheck(BlockPos pos) {
-    return !(pos.y < -20000000 || pos.y >= 20000000) && pos.x >= -30000000 && pos.z >= -30000000 && pos.x < 30000000 && pos.z < 30000000;
-}
-
 Commands::Commands(MinecraftServer& server) : server_(server) {
     auto& d = dispatcher_;
     // (in vanilla's registration order)
@@ -725,7 +725,7 @@ Commands::Commands(MinecraftServer& server) : server_(server) {
                               return static_cast<int>(usage.size());
                           })
                           .then(argument("command", arg<StringArgument>(StringArgument::Type::GreedyPhrase)).executes([this](const CommandContext& c) {
-                              ParseResults command = dispatcher_.parse(StringReader(c.get<std::string>("command")), c.getSource().sourcePtr());
+                              ParseResults command = dispatcher_.parse(StringReader(c.get<std::string>("command")), c.sourcePtr());
                               if (command.context.getNodes().empty()) throw error("commands.help.failed");
                               auto usage = dispatcher_.getSmartUsage(command.context.getNodes().back().node, c.getSource());
                               for (const auto& [node, line] : usage) c.getSource().sendSuccess(lit("/" + command.reader.getString() + " " + line), false);

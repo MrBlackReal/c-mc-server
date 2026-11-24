@@ -8,6 +8,7 @@ WORK="$(mktemp -d)"
 cd "$WORK"
 echo "eula=true" > eula.txt
 printf 'server-port=%s\nonline-mode=false\n' "$PORT" > server.properties
+python3 "$ROOT/tools/ops_json.py" Alice Bob > ops.json # (the tests use op commands)
 "$BIN" ${SERVER_ARGS:-} < /dev/null > server.log 2>&1 &
 SERVER=$!
 trap 'kill $SERVER 2>/dev/null || true; wait $SERVER 2>/dev/null || true; rm -rf "$WORK"' EXIT

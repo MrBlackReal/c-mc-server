@@ -141,10 +141,10 @@ public:
         return nullptr;
     }
 
-    // LevelChunkTicks: scheduled block ticks in this chunk (absolute trigger times), and saved
-    // ticks for blocks whose tick() isn't ported yet, kept as loaded.
+    // LevelChunkTicks: scheduled block and fluid ticks in this chunk (absolute trigger times), and
+    // saved ticks for blocks whose tick() isn't ported yet, kept as loaded.
     struct ScheduledTick {
-        uint32_t block;
+        uint32_t block; // (the fluid type for fluid ticks)
         BlockPos pos;
         int64_t triggerTick;
         int priority;      // TickPriority value, lower runs first
@@ -152,6 +152,7 @@ public:
     };
     std::vector<ScheduledTick> blockTicks;
     std::vector<nbt::Compound> unportedBlockTicks;
+    std::vector<ScheduledTick> fluidTicks;
 
     // Entity storage (entities/r.X.Z.mca). Entities we don't simulate yet are kept verbatim.
     std::vector<nbt::Compound> otherEntities;

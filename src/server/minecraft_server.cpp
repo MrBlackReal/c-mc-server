@@ -38,7 +38,25 @@ void setNonBlocking(int fd) { fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBL
 
 MinecraftServer::MinecraftServer(ServerProperties properties) : properties_(std::move(properties)), playerList_(*this) {
     defaultGameType_ = gameTypeByName(properties_.gamemode, GameType::Survival);
+    commands_ = std::make_unique<commands::Commands>(*this);
+    // Services.create: offline servers resolve unknown names to offline ids; online ones ask the
+    // profile repository.
+    nameToIdCache_.resolveOfflineUsers(!properties_.onlineMode);
+    if (properties_.onlineMode) {
+        nameToIdCache_.setProfileLookup([sessions = sessionService_](const std::string& name) -> std::optional<NameAndId> {
+            auto found = sessions->findProfileByName(name);
+            if (!found) return std::nullopt;
+            return NameAndId{found->first, found->second};
+        });
+    }
 }
+
+int MinecraftServer::getProfilePermissions(const UUID& id) const {
+    const ServerOpList::Entry* op = playerList_.ops().get(id);
+    return op ? op->level : commands::kLevelAll;
+}
+
+void MinecraftServer::sendSystemMessage(const Component& message) { log::info("{}", message.getString()); }
 
 namespace {
 // WorldOptions.parseSeed: a number, else String.hashCode(), else random.
@@ -244,6 +262,7 @@ int MinecraftServer::run() {
     }
     log::info("Starting Minecraft server on {}:{}", properties_.serverIp.empty() ? "*" : properties_.serverIp, properties_.serverPort);
     if (!bind()) return 1;
+    playerList_.loadOps(); // DedicatedPlayerList
     log::info("Preparing level \"{}\"", properties_.levelName);
     if (!loadLevel()) return 1;
 
@@ -370,16 +389,7 @@ void MinecraftServer::readConsole() {
 }
 
 void MinecraftServer::handleConsoleCommand(const std::string& line) {
-    std::string cmd = line[0] == '/' ? line.substr(1) : line;
-    if (cmd == "stop") {
-        halt();
-        return;
-    }
-    if (cmd == "save-all" || cmd == "save-all flush") {
-        saveEverything(true);
-        return;
-    }
-    commands::execute({*this, nullptr}, cmd);
+    commands_->performPrefixedCommand(commands::CommandSourceStack::forServer(*this), line);
 }
 
 void MinecraftServer::onGameRuleChanged(GameRules::Rule rule) {
@@ -406,6 +416,7 @@ void MinecraftServer::tick() {
     clocks_.tick(advanceTime());
     overworld_->setGameTime(clocks_.gameTime());
     overworld_->tickBlocks();
+    overworld_->tickFluids();
     overworld_->tickChunks();
     overworld_->tickEntities();
     overworld_->tickBlockEntities();

@@ -16,6 +16,8 @@ namespace direction {
 inline constexpr std::array<Direction, 6> kAll = {Direction::Down, Direction::Up, Direction::North,
                                                    Direction::South, Direction::West, Direction::East};
 inline constexpr std::array<Direction, 4> kHorizontal = {Direction::North, Direction::South, Direction::West, Direction::East};
+// Direction.Plane.HORIZONTAL (iteration order matters wherever vanilla loops over it)
+inline constexpr std::array<Direction, 4> kHorizontalPlane = {Direction::North, Direction::East, Direction::South, Direction::West};
 
 constexpr int stepX(Direction d) { return d == Direction::East ? 1 : d == Direction::West ? -1 : 0; }
 constexpr int stepY(Direction d) { return d == Direction::Up ? 1 : d == Direction::Down ? -1 : 0; }

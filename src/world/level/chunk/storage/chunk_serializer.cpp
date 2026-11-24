@@ -1,5 +1,7 @@
 #include "world/level/chunk/storage/chunk_serializer.hpp"
 
+#include "world/level/material/fluids.hpp"
+
 #include <set>
 
 #include "generated/registries.hpp"
@@ -253,7 +255,18 @@ nbt::Compound write(const LevelChunk& chunk, int64_t gameTime, const light::Leve
         blockTicks.items.push_back(std::move(saved));
     }
     tag.put("block_ticks", std::move(blockTicks));
-    if (!tag.contains("fluid_ticks")) tag.put("fluid_ticks", nbt::List{});
+    nbt::List fluidTicks{nbt::TagType::Compound, {}};
+    for (const auto& t : chunk.fluidTicks) {
+        nbt::Compound saved;
+        saved.put("i", std::string(fluids::name(static_cast<uint8_t>(t.block))));
+        saved.put("x", t.pos.x);
+        saved.put("y", t.pos.y);
+        saved.put("z", t.pos.z);
+        saved.put("t", static_cast<int32_t>(t.triggerTick - gameTime));
+        saved.put("p", t.priority);
+        fluidTicks.items.push_back(std::move(saved));
+    }
+    tag.put("fluid_ticks", std::move(fluidTicks));
     return tag;
 }
 

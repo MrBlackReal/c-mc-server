@@ -120,8 +120,16 @@ public:
     void tick() override;
     void onDisconnect(const Component& reason) override;
 
-    void teleport(double x, double y, double z, float yRot, float xRot);
-    void setGameMode(GameType mode);
+    void teleport(double x, double y, double z, float yRot, float xRot) { teleport(x, y, z, yRot, xRot, 0); }
+    // ServerGamePacketListenerImpl.teleport(PositionMoveRotation, Set<Relative>): `relatives` are
+    // ClientboundPlayerPositionPacket's flags; relative components are offsets from where the player is.
+    void teleport(double x, double y, double z, float yRot, float xRot, int relatives);
+    // ServerPlayer.setGameMode: false if the player already is in that mode.
+    bool setGameMode(GameType mode);
+    // ServerGamePacketListenerImpl.disconnect
+    void disconnect(const Component& reason) { conn_.disconnect(reason); }
+    // ServerPlayer.sendChatMessage
+    void sendChatMessage(const chat::PlayerChatMessage& message, const chat::ChatTypeBound& chatType);
     void sendAbilities();
     void sendSystemMessage(const Component& message);
     ServerPlayer& player() { return player_; }
@@ -137,6 +145,7 @@ private:
     void handleChat(ByteReader& in);
     void handleCommand(const std::string& command, const std::map<std::string, chat::PlayerChatMessage>* signedArguments = nullptr);
     void handleSignedCommand(ByteReader& in);
+    void handleCommandSuggestion(ByteReader& in);
     void handleChatSessionUpdate(ByteReader& in);
     void handleChatAck(ByteReader& in);
     bool tryHandleChat(const std::string& message, bool isCommand);
@@ -176,6 +185,11 @@ private:
     UseResult useItemStackOn(ItemStack& stack, int hand, BlockPos pos, Direction face, double hx, double hy, double hz);
     UseResult transformBlock(const std::string& id, ItemStack& stack, int hand, BlockPos pos, Direction face);
     UseResult useItemOnCauldron(ItemStack& stack, int hand, BlockPos pos, BlockStateId state);
+    // ServerGamePacketListenerImpl.handleUseItem -> ServerPlayerGameMode.useItem -> Item.use
+    // (game_item_use.cpp): so far buckets.
+    void handleUseItem(ByteReader& in);
+    UseResult useBucket(ItemStack& stack, int hand, ItemStack& transformedTo);
+    bool emptyBucketContents(uint8_t content, BlockPos pos, const std::optional<ServerLevel::BlockHit>& hit);
     nbt::Compound* blockEntityAt(BlockPos pos, std::string_view type);
     bool openBlockMenu(BlockPos pos, BlockStateId state);
     void giveOrDrop(ItemStack stack);

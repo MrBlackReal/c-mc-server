@@ -162,10 +162,15 @@ bool ServerGamePacketListener::executeSignClickCommands(BlockPos pos, bool front
             }
         }
     }
-    for (std::string c : commandsToRun) {
-        if (c.starts_with('/')) c.erase(0, 1); // Commands.performPrefixedCommand
-        commands::execute({server_, this}, c);
-    }
+    // SignBlockEntity.createCommandSourceStack: no output, at the sign's centre, game master level,
+    // named after the player.
+    commands::CommandSourceStack source = commands::CommandSourceStack::forPlayer(server_, player_);
+    source.x = pos.x + 0.5, source.y = pos.y + 0.5, source.z = pos.z + 0.5;
+    source.rotX = source.rotY = 0;
+    source.permissions = commands::PermissionSet::forLevel(commands::kLevelGamemasters);
+    source.output = commands::Output::Null;
+    source.outputPlayer = nullptr;
+    for (const std::string& c : commandsToRun) server_.commands().performPrefixedCommand(source, c);
     if (!allowOp && any) sendOverlay(Component::translatable("sign.click_actions_disabled").withColor("red"));
     return any;
 }

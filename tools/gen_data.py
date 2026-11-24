@@ -198,6 +198,10 @@ def gen_behaviour():
            "namespace mc::gen {",
            "// Per block state flags from tools/extractor (see BlockFlags in block_state.hpp).",
            "extern const std::span<const uint32_t> kStateFlags;",
+           "// Per block state fluid facts from tools/extractor (see FluidInfo in fluids.hpp).",
+           "extern const std::span<const uint32_t> kStateFluid;",
+           "// Shapes.mergedFaceOccludes(kShapes[a], kShapes[b], d): bit d (3D data value) of [a * kShapes.size() + b].",
+           "extern const std::span<const uint8_t> kShapeFaceOccludes;",
            "struct BlockBehaviourInfo {",
            "    std::string_view classes; // Java class chain, most derived first, '|' separated",
            "    float hardness;",
@@ -226,6 +230,9 @@ def gen_behaviour():
            "// Collision shapes (VoxelShape.toAabbs), deduplicated; kStateShape indexes kShapes per state.",
            "extern const std::span<const std::span<const Box>> kShapes;",
            "extern const std::span<const uint16_t> kStateShape;",
+           "// Outline shapes (BlockState.getShape with an empty context), the same way.",
+           "extern const std::span<const std::span<const Box>> kOutlineShapes;",
+           "extern const std::span<const uint16_t> kStateOutline;",
            "// Light occlusion faces (LightEngine.getOcclusionShape per Direction, 3D data value order), as",
            "// 16x16 masks of 4 words each; kStateLightFaces indexes kLightFaces per state (-1: empty shape).",
            "struct LightFaces { uint64_t face[6][4]; };",
@@ -288,6 +295,17 @@ def gen_behaviour():
     for i in range(0, len(flags), 16):
         cpp.append("    " + ", ".join(f"{f & 0xFFFFFFFF}u" for f in flags[i:i + 16]) + ",")
     cpp.append("};")
+    fluids = ex["state_fluid"]
+    cpp.append("constexpr uint32_t stateFluid[] = {")
+    for i in range(0, len(fluids), 16):
+        cpp.append("    " + ", ".join(f"{f}u" for f in fluids[i:i + 16]) + ",")
+    cpp.append("};")
+    occ = ex["shape_face_occludes"]
+    assert len(occ) == len(ex["shapes"]) ** 2
+    cpp.append("constexpr uint8_t shapeFaceOccludes[] = {")
+    for i in range(0, len(occ), 64):
+        cpp.append("    " + ",".join(map(str, occ[i:i + 64])) + ",")
+    cpp.append("};")
     instrument_index = {inst["name"]: i for i, inst in enumerate(ex["instruments"])}
     rows = [None] * len(block_ids)
     for name, b in ex["blocks"].items():
@@ -307,6 +325,15 @@ def gen_behaviour():
         boxes = ", ".join("{" + ", ".join(f"{v}f" for v in b) + "}" for b in shape)
         cpp.append(f"constexpr Box shape{i}[] = {{{boxes}}};" if shape else f"constexpr std::span<const Box> shape{i};")
     cpp.append("constexpr std::span<const Box> shapes[] = {" + ", ".join(f"shape{i}" for i in range(len(ex["shapes"]))) + "};")
+    for i, shape in enumerate(ex["outline_shapes"]):
+        boxes = ", ".join("{" + ", ".join(f"{v}f" for v in b) + "}" for b in shape)
+        cpp.append(f"constexpr Box outline{i}[] = {{{boxes}}};" if shape else f"constexpr std::span<const Box> outline{i};")
+    cpp.append("constexpr std::span<const Box> outlineShapes[] = {" + ", ".join(f"outline{i}" for i in range(len(ex["outline_shapes"]))) + "};")
+    so = ex["state_outline"]
+    cpp.append("constexpr uint16_t stateOutline[] = {")
+    for i in range(0, len(so), 32):
+        cpp.append("    " + ", ".join(map(str, so[i:i + 32])) + ",")
+    cpp.append("};")
     ss = ex["state_shape"]
     cpp.append("constexpr LightFaces lightFaces[] = {")
     for faces in ex["face_masks"]:
@@ -392,10 +419,14 @@ def gen_behaviour():
             "const std::span<const AttributeInfo> kAttributes{attributes};",
             "const std::span<const std::span<const AttributeModifierInfo>> kEffectModifiers{effectMods};",
             "const std::span<const uint32_t> kStateFlags{flags};",
+            "const std::span<const uint32_t> kStateFluid{stateFluid};",
+            "const std::span<const uint8_t> kShapeFaceOccludes{shapeFaceOccludes};",
             "const std::span<const BlockBehaviourInfo> kBlockBehaviour{blocks};",
             "const std::span<const ItemInfo> kItems{items};",
             "const std::span<const std::span<const Box>> kShapes{shapes};",
             "const std::span<const uint16_t> kStateShape{stateShape};",
+            "const std::span<const std::span<const Box>> kOutlineShapes{outlineShapes};",
+            "const std::span<const uint16_t> kStateOutline{stateOutline};",
             "const std::span<const LightFaces> kLightFaces{lightFaces};",
             "const std::span<const int16_t> kStateLightFaces{stateLightFaces};",
             "} // namespace mc::gen", ""]

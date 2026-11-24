@@ -17,6 +17,7 @@
 #include "world/phys/aabb.hpp"
 #include "world/level/chunk/storage/region_file.hpp"
 #include "world/level/gamerules/game_rules.hpp"
+#include "world/level/material/fluids.hpp"
 #include "util/legacy_random.hpp"
 
 namespace mc {
@@ -52,6 +53,8 @@ public:
     static constexpr int kUpdateInvisible = 4;
     static constexpr int kUpdateKnownShape = 16; // no neighbour shape updates
     static constexpr int kSuppressDrops = 32;
+    static constexpr int kMovedByPiston = 64;
+    static constexpr int kUpdateSkipShapeUpdateOnWire = 128;
     static constexpr int kSkipBlockEntitySideEffects = 256;
     static constexpr int kSkipOnPlace = 512;
 
@@ -164,17 +167,46 @@ public:
     std::vector<AABB> collisionBoxes(const AABB& box);
     // Level.clip with ClipContext.Block.COLLIDER (and Fluid.SOURCE_ONLY if `sourceFluids`): the block the
     // segment hits first, if any.
-    std::optional<BlockPos> clip(double fx, double fy, double fz, double tx, double ty, double tz, bool sourceFluids);
+    std::optional<BlockPos> clip(double fx, double fy, double fz, double tx, double ty, double tz, bool sourceFluids) {
+        auto hit = clip(fx, fy, fz, tx, ty, tz, ClipBlock::Collider, sourceFluids ? ClipFluid::SourceOnly : ClipFluid::None);
+        return hit ? std::optional<BlockPos>(hit->pos) : std::nullopt;
+    }
+    // Level.clip(ClipContext): the first block or fluid the segment hits (BlockHitResult), with the
+    // block's collision or outline shape (ClipContext.Block) and the fluids ClipContext.Fluid picks.
+    enum class ClipBlock { Collider, Outline };
+    enum class ClipFluid { None, SourceOnly, Any };
+    struct BlockHit {
+        BlockPos pos;
+        Direction direction; // the face hit
+        double x, y, z;      // where
+        bool inside;         // the segment started inside the shape
+    };
+    std::optional<BlockHit> clip(double fx, double fy, double fz, double tx, double ty, double tz, ClipBlock block, ClipFluid fluid);
     BlockStateId getBlockState(int x, int y, int z);
     BlockStateId getBlockState(BlockPos p) { return getBlockState(p.x, p.y, p.z); }
     // Level.setBlock: sets the block, runs neighbour shape updates (updateShape, unless
     // kUpdateKnownShape) and records the change for clients (kUpdateClients). Returns false if
     // nothing changed.
     bool setBlock(BlockPos pos, BlockStateId state, int flags = kUpdateAll);
-    // LevelAccessor.neighborShapeChanged: re-run `pos`'s updateShape for its neighbour towards `toNeighbour`.
+    // Level.setBlock with an update limit: `depth` is how far down a chain of shape updates this is
+    // (vanilla counts its limit of 512 down; shape updates stop at depth 512).
+    bool setBlock(BlockPos pos, BlockStateId state, int flags, int depth) { return setBlockAt(pos, state, flags, depth); }
+    // LevelAccessor.neighborShapeChanged: re-run `pos`'s updateShape for its neighbour towards
+    // `toNeighbour` (whose state is taken now). Queued on the neighbour updater.
     void neighborShapeChanged(Direction toNeighbour, BlockPos pos, BlockPos neighbourPos, int flags, int depth);
-    // Level.destroyBlock: break particles, optionally the block's drops, then air (or its fluid).
-    bool destroyBlock(BlockPos pos, bool dropResources, const ItemStack* tool = nullptr, int flags = kUpdateAll);
+    // Level.updateNeighborsAt: neighborChanged for the six neighbours of `pos` (NeighborUpdater.UPDATE_ORDER),
+    // except the one towards `skip`. `sourceBlock` is the block that changed.
+    void updateNeighborsAt(BlockPos pos, uint32_t sourceBlock) { updateNeighborsAtExceptFromFacing(pos, sourceBlock, std::nullopt); }
+    void updateNeighborsAtExceptFromFacing(BlockPos pos, uint32_t sourceBlock, std::optional<Direction> skip);
+    // Level.neighborChanged: BlockBehaviour.neighborChanged for the block at `pos`.
+    void neighborChanged(BlockPos pos, uint32_t sourceBlock);
+    // Level.updateNeighboursOnBlockSet: what /fill and /setblock do after placing without neighbour
+    // updates: the neighbours of the block now at `pos` are told.
+    void updateNeighboursOnBlockSet(BlockPos pos, BlockStateId oldState);
+    // The world option max-chained-neighbor-updates (set by the server; negative: unlimited).
+    int maxChainedNeighborUpdates = 1000000;
+    // Level.destroyBlock: break particles, optionally the block's drops, then its fluid (or air).
+    bool destroyBlock(BlockPos pos, bool dropResources, const ItemStack* tool = nullptr, int flags = kUpdateAll, int depth = 0);
     // Block.popResource / Containers.dropContents
     void popResource(BlockPos pos, ItemStack stack);
     void dropContents(BlockPos pos, const nbt::Compound& blockEntity);
@@ -247,6 +279,15 @@ public:
     bool hasScheduledTick(BlockPos pos, uint32_t block);
     // ServerLevel.tick's blockTicks.tick: runs the ticks that are due, in trigger/priority/schedule order.
     void tickBlocks();
+    // The same for fluids (Level.scheduleTick(pos, Fluid, delay), fluidTicks.tick -> tickFluid).
+    void scheduleFluidTick(BlockPos pos, uint8_t fluid, int delay, int priority = 0);
+    bool hasScheduledFluidTick(BlockPos pos, uint8_t fluid);
+    void tickFluids();
+    // Level.getFluidState
+    fluids::FluidState getFluidState(BlockPos pos) { return fluids::stateOf(getBlockState(pos)); }
+    // The dimension's minecraft:gameplay/fast_lava and water_evaporates attributes.
+    bool fastLava() const { return fastLava_; }
+    bool waterEvaporates() const { return waterEvaporates_; }
     // Level.getDifficulty (Difficulty id) and ChunkMap.anyPlayerCloseEnoughTo (non-spectators
     // within `distance` of the block's corner); set by the server.
     int difficulty = 2;
@@ -321,11 +362,30 @@ private:
     void loadEntities(LevelChunk& chunk);
     void saveEntities(LevelChunk& chunk);
     void unloadEntities(LevelChunk& chunk);
-    void updateNeighbourShapes(BlockPos pos, int flags, int depth);
+    void updateNeighbourShapes(BlockPos pos, BlockStateId state, int flags, int depth);
+    // CollectingNeighborUpdater: updates made while one runs wait in a stack and run depth first,
+    // in the order they were added.
+    struct NeighborUpdate {
+        enum class Kind : uint8_t { Shape, Simple, Multi } kind;
+        BlockPos pos;          // Shape/Simple: the block updated; Multi: the source
+        BlockPos neighbourPos; // Shape
+        Direction direction;   // Shape: towards the neighbour
+        BlockStateId neighbourState; // Shape
+        int flags, depth;      // Shape
+        uint32_t sourceBlock;  // Simple/Multi
+        int8_t idx, skip;      // Multi: next direction in UPDATE_ORDER, the one skipped (-1: none)
+    };
+    void addAndRun(BlockPos pos, NeighborUpdate update);
+    void runNeighborUpdates();
+    bool runNext(NeighborUpdate& update); // false when the update is done
+    std::vector<NeighborUpdate> updateStack_, addedThisLayer_;
+    int neighborUpdateCount_ = 0;
     bool setBlockAt(BlockPos pos, BlockStateId state, int flags, int depth);
     void markChanged(BlockPos pos);
     void addEntity(std::unique_ptr<Entity> entity);
     void unpackBlockTicks(LevelChunk& chunk);
+    template <class Run>
+    void runTicks(std::vector<LevelChunk::ScheduledTick> LevelChunk::*ticks, Run run);
     void initializeLight(LevelChunk& chunk);
     void tickChunk(LevelChunk& chunk, int tickSpeed);
     void tickPrecipitation(BlockPos pos);
@@ -358,6 +418,7 @@ private:
     std::unordered_map<int64_t, int> signEditors_;
     std::unordered_map<int64_t, std::weak_ptr<BlockEntityContainer>> containers_;
     int64_t gameTime_ = 0;
+    bool fastLava_ = false, waterEvaporates_ = false;
     int64_t subTickCount_ = 0;
     GameRules defaultGameRules_;
     GameRules* gameRules_ = &defaultGameRules_;

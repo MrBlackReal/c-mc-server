@@ -10,6 +10,7 @@ export TMPDIR="$WORK"
 cd "$WORK"
 echo "eula=true" > eula.txt
 printf 'server-port=%s\nonline-mode=false\n' "$PORT" > server.properties
+python3 "$ROOT/tools/ops_json.py" Alice Bob > ops.json # (the tests use op commands)
 SERVER=
 start() {
     "$BIN" < /dev/null >> server.log 2>&1 &

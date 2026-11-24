@@ -34,6 +34,8 @@ public:
     std::string levelType = "minecraft:flat";
     bool syncChunkWrites = true;
     std::string regionFileCompression = "deflate"; // RegionFileVersion: deflate, lz4 or none
+    int opPermissionLevel = 4;        // op-permission-level: the level /op gives (operatorUserPermissions)
+    bool broadcastConsoleToOps = true; // broadcast-console-to-ops
 
 private:
     std::map<std::string, std::string> raw_;

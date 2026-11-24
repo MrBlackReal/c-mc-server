@@ -137,16 +137,39 @@ obvious counterpart to compare against:
   `[Alice] hi`), the `[Not Secure]` log tag, and players' display names with their click and hover
   events as in vanilla
 
+**Fluids, neighbour updates and commands** ✅
+- Water and lava as in vanilla's `FlowingFluid`: spreading and weakening (water 7 blocks, lava 3, faster
+  in fast-lava dimensions), falling, finding the nearest drop within 4 (lava 2) blocks, new sources
+  between two (`water_source_conversion`, `lava_source_conversion`), flowing out of and into
+  waterlogged blocks, washing away what's in the way (with its drops; lava fizzes), lava turning to
+  obsidian or cobblestone next to water, stone under falling lava, basalt over soul soil by blue ice.
+  Fluid ticks are scheduled and saved like vanilla's (`fluid_ticks`), so flows carry on across
+  restarts and between this server and vanilla. Which blocks fluids may enter or pass comes from
+  vanilla itself (the extractor records its answers, tags included), and `tools/test_fluids.py`
+  ends up with every block identical to vanilla's
+- Buckets: filling from sources and waterlogged blocks (and powder snow), emptying into air, into
+  replaceable blocks (dropping them) and into waterloggable blocks; campfires and candles go out.
+  Sponges soak up water; water over soul sand or magma becomes a bubble column (and back)
+- Neighbour updates: a port of `CollectingNeighborUpdater` runs shape updates and `neighborChanged`
+  in vanilla's order (and limits); `/fill` and `/setblock` update neighbours like vanilla
+- Commands go through a port of Brigadier with vanilla's command tree, permissions, error messages
+  and tab completion: `/effect`, `/fill`, `/gamemode`, `/gamerule`, `/help`, `/kick`, `/list`, `/me`,
+  `/msg` (`/tell`, `/w`), `/say`, `/seed`, `/setblock`, `/teammsg`, `/teleport` (`/tp`), `/time`, and the
+  dedicated server's `/op`, `/deop`, `/save-all`, `/stop`. Operators are kept in `ops.json` (with
+  `op-permission-level`), names in `usercache.json`; signed arguments for every command that has them
+
 Known gaps: bone meal on grass, moss, nylium, fungi and flowers (they place world-gen features);
 turtle eggs don't hatch and dried ghasts stay hydrated (no mobs); no food/hunger, mobs,
-explosions, portals, weather, maps (cartography table), fluids or redstone; Haste/Mining Fatigue
+explosions, portals, weather, maps (cartography table) or redstone (so nothing reacts to
+`neighborChanged` but fluids and sponges); entities don't float or drift in
+fluids; fish buckets release no fish; dispensers don't use buckets; Haste/Mining Fatigue
 don't affect dig speed; the anvil compares a typed name with the item's name key, not its English
 text.
 
 **Next milestones**
-1. Fluids, redstone
-2. Nether/End, entities, AI, physics; noise world generation; Brigadier (with it, signed
-   arguments for every command, /msg and /me); using items in the air (food, bows, buckets, spawn eggs)
+1. Redstone
+2. Nether/End, entities, AI, physics (swimming, items floating); noise world generation; the rest
+   of the commands; using items in the air (food, bows, potions, spawn eggs)
 
 Known shortcuts are marked `TODO` in the source.
 
@@ -165,7 +188,8 @@ It reads and writes `server.properties` like vanilla. Supported keys so far: `se
 `server-port`, `motd`, `max-players`, `view-distance`, `simulation-distance`,
 `network-compression-threshold`, `gamemode`, `difficulty`, `hardcore`, `accepts-transfers`,
 `level-name`, `level-seed`, `level-type`, `sync-chunk-writes`, `region-file-compression`,
-`online-mode`, `enforce-secure-profile`, `prevent-proxy-connections`.
+`online-mode`, `enforce-secure-profile`, `prevent-proxy-connections`, `op-permission-level`,
+`broadcast-console-to-ops`. Operators go in `ops.json` (`op <name>` on the console).
 
 Worlds: new worlds are superflat (the only generator ported so far, so `level-type` defaults to
 `minecraft:flat`). Existing vanilla worlds with normal terrain load fine; chunks that don't exist
@@ -193,6 +217,8 @@ tools/run_test.sh tools/test_bundles.py         # bundles in the inventory
 tools/test_light.sh                             # light and heightmaps vs vanilla, incl. saved worlds
 tools/run_test.sh tools/test_random_ticks.py    # growth, decay, melting with random_tick_speed up
 tools/run_test.sh tools/test_bone_meal.py       # trees, crops, huge mushrooms from bone meal
+tools/run_test.sh tools/test_fluids.py          # flowing, sources, lava and water, sponges, buckets
+FLUID_DUMP=out.json tools/run_test.sh tools/test_fluids.py  # + every block changed, to diff with vanilla's
 BUNDLE=<unzipped jar> tools/feature_check.sh    # trees/huge mushrooms vs vanilla's code, same seeds
 tools/test_online.sh                            # online-mode logins, both servers, stand-in services
 tools/test_chat.sh                              # secure chat with enforce-secure-profile, both servers
@@ -217,8 +243,10 @@ break → restart → place → check-the-saved-world steps on a copy of that wo
 - `packets.json`, `registries.json`, `blocks.json`: from the vanilla data generator (`--reports`)
 - `vanilla_config.json`: synchronized registry order and tags, recorded from a vanilla server
 - `extracted.json`: block classes, per-state flags (replaceable, collision, sturdy faces, fluids,
-  light emission/dampening), light occlusion faces, hardness, sounds and item→block mapping, from
-  `tools/extractor` run against the jar
+  light emission/dampening), light occlusion faces, collision and outline shapes, how fluids treat
+  each state (and which collision shapes close the face between two blocks), hardness, sounds and
+  item→block mapping, from `tools/extractor` run against the jar (with vanilla's block tags bound;
+  it checks how `fluids.cpp` combines what it records against vanilla's own methods)
 - `item_components.json`: every item's default components (and a digest: max stack size, tool,
   equippable, fuel, ...) from the components report
 - `loot_tables.json`, `recipes.json`, `enchantments.json`, `*_providers.json`, ...: data packs

@@ -21,6 +21,7 @@
 #include "world/level/block/entity/block_entity_ticker.hpp"
 #include "world/item/item_nbt.hpp"
 #include "world/level/chunk/storage/chunk_serializer.hpp"
+#include "world/level/material/fluids.hpp"
 #include "world/level/storage/loot/loot_tables.hpp"
 
 namespace mc {
@@ -208,6 +209,11 @@ ServerLevel::ServerLevel(std::string dimension, std::string dimensionType, Dimen
     spawn_ = {0, generator_.surfaceY(info_), 0};
     lightChunks_ = std::make_unique<LightChunks>(*this);
     light_ = std::make_unique<light::LevelLightEngine>(*lightChunks_, dimensionType_ != "minecraft:the_nether" && dimensionType_ != "minecraft:the_end");
+    // The dimension type's gameplay attributes (no biome overrides them).
+    json::Value elements = json::parse(gen::kRegistryElementsJson);
+    const json::Value& attributes = elements["minecraft:dimension_type"][dimensionType_]["attributes"];
+    fastLava_ = attributes["minecraft:gameplay/fast_lava"].isBool() && attributes["minecraft:gameplay/fast_lava"].boolean();
+    waterEvaporates_ = attributes["minecraft:gameplay/water_evaporates"].isBool() && attributes["minecraft:gameplay/water_evaporates"].boolean();
 }
 
 LevelChunk& ServerLevel::getChunk(ChunkPos pos) {
@@ -316,6 +322,14 @@ void ServerLevel::writeLightData(ByteWriter& out, ChunkPos pos, const std::vecto
 
 void ServerLevel::unpackBlockTicks(LevelChunk& chunk) {
     // SerializableChunkData: saved ticks become scheduled ones, relative to the current time.
+    if (const nbt::List* fluidTicks = chunk.original ? chunk.original->getList("fluid_ticks") : nullptr) {
+        for (const auto& e : fluidTicks->items) {
+            const nbt::Compound* t = e.asCompound();
+            auto fluid = t ? fluids::byName(t->getString("i")) : std::nullopt;
+            if (!fluid || *fluid == fluids::kEmpty) continue;
+            chunk.fluidTicks.push_back({*fluid, {t->getInt("x"), t->getInt("y"), t->getInt("z")}, gameTime_ + t->getInt("t"), t->getInt("p"), subTickCount_++});
+        }
+    }
     const nbt::List* saved = chunk.original ? chunk.original->getList("block_ticks") : nullptr;
     if (!saved) return;
     for (const auto& e : saved->items) {
@@ -363,11 +377,27 @@ void ServerLevel::tickBlockEntities() {
     }
 }
 
-void ServerLevel::tickBlocks() {
+bool ServerLevel::hasScheduledFluidTick(BlockPos pos, uint8_t fluid) {
+    LevelChunk* chunk = getChunkIfLoaded({pos.x >> 4, pos.z >> 4});
+    if (!chunk) return false;
+    for (const auto& t : chunk->fluidTicks)
+        if (t.pos == pos && t.block == fluid) return true;
+    return false;
+}
+
+void ServerLevel::scheduleFluidTick(BlockPos pos, uint8_t fluid, int delay, int priority) {
+    if (pos.y < minY() || pos.y > maxY() || fluid == fluids::kEmpty || hasScheduledFluidTick(pos, fluid)) return;
+    LevelChunk& chunk = getChunk({pos.x >> 4, pos.z >> 4});
+    chunk.fluidTicks.push_back({fluid, pos, gameTime_ + delay, priority, subTickCount_++});
+    chunk.dirty = true;
+}
+
+template <class Run>
+void ServerLevel::runTicks(std::vector<LevelChunk::ScheduledTick> LevelChunk::*member, Run run) {
     std::vector<LevelChunk::ScheduledTick> due;
     for (auto& [_, chunk] : chunks_) {
         if (!inEntityTickingRange(chunk->pos())) continue; // LevelTicks' isPositionTickingWithEntitiesLoaded
-        auto& ticks = chunk->blockTicks;
+        auto& ticks = (*chunk).*member;
         auto split = std::stable_partition(ticks.begin(), ticks.end(), [&](const auto& t) { return t.triggerTick > gameTime_; });
         if (split == ticks.end()) continue;
         due.insert(due.end(), split, ticks.end());
@@ -380,13 +410,25 @@ void ServerLevel::tickBlocks() {
         return a.subTickOrder < b.subTickOrder;
     });
     if (due.size() > 65536) { // LevelTicks' per-tick limit: the rest wait for the next tick
-        for (auto it = due.begin() + 65536; it != due.end(); ++it) getChunk({it->pos.x >> 4, it->pos.z >> 4}).blockTicks.push_back(*it);
+        for (auto it = due.begin() + 65536; it != due.end(); ++it) (getChunk({it->pos.x >> 4, it->pos.z >> 4}).*member).push_back(*it);
         due.resize(65536);
     }
-    for (const auto& t : due) {
+    for (const auto& t : due) run(t);
+}
+
+void ServerLevel::tickBlocks() {
+    runTicks(&LevelChunk::blockTicks, [&](const LevelChunk::ScheduledTick& t) {
         BlockStateId state = getBlockState(t.pos);
         if (blocks::blockOf(state) == t.block) block_behaviour::tick(*this, t.pos, state); // ServerLevel.tickBlock
-    }
+    });
+}
+
+void ServerLevel::tickFluids() {
+    runTicks(&LevelChunk::fluidTicks, [&](const LevelChunk::ScheduledTick& t) {
+        BlockStateId state = getBlockState(t.pos); // ServerLevel.tickFluid
+        fluids::FluidState fluid = fluids::stateOf(state);
+        if (fluid.type == t.block) fluids::tick(*this, t.pos, state, fluid);
+    });
 }
 
 void ServerLevel::tickChunks() {
@@ -549,52 +591,82 @@ void ServerLevel::tickEntities() {
 }
 
 namespace {
-// AABB.clip / VoxelShape.clip for one box: where the segment enters it (as a fraction of the
-// segment), or where it starts if it starts inside.
-std::optional<double> clipBox(const AABB& b, double fx, double fy, double fz, double tx, double ty, double tz) {
+// Direction.getApproximateNearest: the direction closest to (x, y, z) (the first one on ties).
+Direction approximateNearest(double x, double y, double z) {
+    Direction best = Direction::North;
+    double bestDot = -std::numeric_limits<double>::infinity();
+    for (int i = 0; i < 6; i++) {
+        auto d = static_cast<Direction>(i);
+        double dot = x * direction::stepX(d) + y * direction::stepY(d) + z * direction::stepZ(d);
+        if (dot > bestDot) best = d, bestDot = dot;
+    }
+    return best;
+}
+
+// VoxelShape.clip for a shape made of `boxes` at `pos`: AABB.clip over the boxes (the face entered
+// first), or the starting point when it's inside the shape.
+template <class Boxes>
+std::optional<ServerLevel::BlockHit> clipShape(const Boxes& boxes, BlockPos pos, double fx, double fy, double fz, double tx, double ty, double tz) {
+    if (boxes.empty()) return std::nullopt;
     double dx = tx - fx, dy = ty - fy, dz = tz - fz;
     if (dx * dx + dy * dy + dz * dz < 1.0e-7) return std::nullopt;
-    double px = fx + dx * 0.001, py = fy + dy * 0.001, pz = fz + dz * 0.001; // VoxelShape.clip's test point
-    if (px > b.minX && px < b.maxX && py > b.minY && py < b.maxY && pz > b.minZ && pz < b.maxZ) return 0.001;
-    double lo = 0.0, hi = 1.0;
-    const double from[3] = {fx, fy, fz}, delta[3] = {dx, dy, dz}, mins[3] = {b.minX, b.minY, b.minZ}, maxs[3] = {b.maxX, b.maxY, b.maxZ};
-    for (int a = 0; a < 3; a++) {
-        if (std::abs(delta[a]) < 1.0e-12) {
-            if (from[a] < mins[a] || from[a] > maxs[a]) return std::nullopt;
-            continue;
-        }
-        double t1 = (mins[a] - from[a]) / delta[a], t2 = (maxs[a] - from[a]) / delta[a];
-        if (t1 > t2) std::swap(t1, t2);
-        lo = std::max(lo, t1), hi = std::min(hi, t2);
-        if (lo > hi) return std::nullopt;
+    double px = fx + dx * 0.001 - pos.x, py = fy + dy * 0.001 - pos.y, pz = fz + dz * 0.001 - pos.z;
+    for (const auto& b : boxes)
+        if (px >= b.minX && px < b.maxX && py >= b.minY && py < b.maxY && pz >= b.minZ && pz < b.maxZ)
+            return ServerLevel::BlockHit{pos, direction::opposite(approximateNearest(dx, dy, dz)), fx + dx * 0.001, fy + dy * 0.001, fz + dz * 0.001, true};
+    // AABB.clip(boxes, from, to, pos) with getDirection / clipPoint
+    double scale = 1.0;
+    std::optional<Direction> dir;
+    auto clipPoint = [&](double da, double db, double dc, double point, double minB, double maxB, double minC, double maxC, Direction face, double a, double b,
+                         double c) {
+        double t = (point - a) / da;
+        double pb = b + t * db, pc = c + t * dc;
+        if (0.0 < t && t < scale && minB - 1.0e-7 < pb && pb < maxB + 1.0e-7 && minC - 1.0e-7 < pc && pc < maxC + 1.0e-7) scale = t, dir = face;
+    };
+    for (const auto& b : boxes) {
+        double x0 = pos.x + b.minX, y0 = pos.y + b.minY, z0 = pos.z + b.minZ, x1 = pos.x + b.maxX, y1 = pos.y + b.maxY, z1 = pos.z + b.maxZ;
+        if (dx > 1.0e-7) clipPoint(dx, dy, dz, x0, y0, y1, z0, z1, Direction::West, fx, fy, fz);
+        else if (dx < -1.0e-7) clipPoint(dx, dy, dz, x1, y0, y1, z0, z1, Direction::East, fx, fy, fz);
+        if (dy > 1.0e-7) clipPoint(dy, dz, dx, y0, z0, z1, x0, x1, Direction::Down, fy, fz, fx);
+        else if (dy < -1.0e-7) clipPoint(dy, dz, dx, y1, z0, z1, x0, x1, Direction::Up, fy, fz, fx);
+        if (dz > 1.0e-7) clipPoint(dz, dx, dy, z0, x0, x1, y0, y1, Direction::North, fz, fx, fy);
+        else if (dz < -1.0e-7) clipPoint(dz, dx, dy, z1, x0, x1, y0, y1, Direction::South, fz, fx, fy);
     }
-    return lo;
+    if (!dir) return std::nullopt;
+    return ServerLevel::BlockHit{pos, *dir, fx + scale * dx, fy + scale * dy, fz + scale * dz, false};
 }
 } // namespace
 
-std::optional<BlockPos> ServerLevel::clip(double fx, double fy, double fz, double tx, double ty, double tz, bool sourceFluids) {
+std::optional<ServerLevel::BlockHit> ServerLevel::clip(double fx, double fy, double fz, double tx, double ty, double tz, ClipBlock blockMode,
+                                                       ClipFluid fluidMode) {
     if (fx == tx && fy == ty && fz == tz) return std::nullopt;
-    // What the ray hits in one block: its collision shape, and (SOURCE_ONLY) a source fluid's shape.
-    auto hitAt = [&](int bx, int by, int bz) -> bool {
-        if (by < minY() || by > maxY()) return false;
+    // Level.clip's per-block test: the block's shape and the fluid's, whichever is hit nearer.
+    auto hitAt = [&](int bx, int by, int bz) -> std::optional<BlockHit> {
+        if (by < minY() || by > maxY()) return std::nullopt;
         LevelChunk* chunk = getChunkIfLoaded({bx >> 4, bz >> 4});
-        if (!chunk) return false;
+        if (!chunk) return std::nullopt;
+        BlockPos pos{bx, by, bz};
         BlockStateId s = chunk->getBlockState(bx & 15, by, bz & 15);
-        uint32_t f = blocks::flags(s);
-        if (f & blocks::kHasCollision)
-            for (const auto& b : gen::kShapes[gen::kStateShape[s]])
-                if (clipBox({bx + b.minX, by + b.minY, bz + b.minZ, bx + b.maxX, by + b.maxY, bz + b.maxZ}, fx, fy, fz, tx, ty, tz)) return true;
-        if (sourceFluids && (f & blocks::kFluidSource) && (f & (blocks::kWater | blocks::kLava))) // FluidState.getShape: 8/9 high
-            if (clipBox({static_cast<double>(bx), static_cast<double>(by), static_cast<double>(bz), bx + 1.0, by + 8.0 / 9.0, bz + 1.0}, fx, fy, fz, tx, ty, tz))
-                return true;
-        return false;
+        auto shape = blockMode == ClipBlock::Outline ? gen::kOutlineShapes[gen::kStateOutline[s]] : gen::kShapes[gen::kStateShape[s]];
+        auto blockHit = clipShape(shape, pos, fx, fy, fz, tx, ty, tz); // TODO: interaction shapes (clipWithInteractionOverride)
+        std::optional<BlockHit> fluidHit;
+        fluids::FluidState fluid = fluids::stateOf(s);
+        if (fluidMode == ClipFluid::Any ? !fluid.isEmpty() : fluidMode == ClipFluid::SourceOnly && fluid.isSource()) {
+            // FlowingFluid.getShape: as high as the fluid (cached per fluid state, so by its own height)
+            gen::Box box{0, 0, 0, 1, fluids::ownHeight(fluid), 1};
+            fluidHit = clipShape(std::span<const gen::Box>(&box, 1), pos, fx, fy, fz, tx, ty, tz);
+        }
+        auto dist = [&](const std::optional<BlockHit>& h) {
+            return h ? (h->x - fx) * (h->x - fx) + (h->y - fy) * (h->y - fy) + (h->z - fz) * (h->z - fz) : std::numeric_limits<double>::max();
+        };
+        return dist(blockHit) <= dist(fluidHit) ? blockHit : fluidHit;
     };
     // BlockGetter.traverseBlocks
     auto lerp = [](double t, double a, double b) { return a + t * (b - a); };
     double toX = lerp(-1.0E-7, tx, fx), toY = lerp(-1.0E-7, ty, fy), toZ = lerp(-1.0E-7, tz, fz);
     double fromX = lerp(-1.0E-7, fx, tx), fromY = lerp(-1.0E-7, fy, ty), fromZ = lerp(-1.0E-7, fz, tz);
     int x = static_cast<int>(std::floor(fromX)), y = static_cast<int>(std::floor(fromY)), z = static_cast<int>(std::floor(fromZ));
-    if (hitAt(x, y, z)) return BlockPos{x, y, z};
+    if (auto hit = hitAt(x, y, z)) return hit;
     double dx = toX - fromX, dy = toY - fromY, dz = toZ - fromZ;
     int sx = dx > 0 ? 1 : dx < 0 ? -1 : 0, sy = dy > 0 ? 1 : dy < 0 ? -1 : 0, sz = dz > 0 ? 1 : dz < 0 ? -1 : 0;
     double tDX = sx == 0 ? std::numeric_limits<double>::max() : sx / dx, tDY = sy == 0 ? std::numeric_limits<double>::max() : sy / dy,
@@ -611,7 +683,7 @@ std::optional<BlockPos> ServerLevel::clip(double fx, double fy, double fz, doubl
         } else {
             z += sz, tZ += tDZ;
         }
-        if (hitAt(x, y, z)) return BlockPos{x, y, z};
+        if (auto hit = hitAt(x, y, z)) return hit;
     }
     return std::nullopt;
 }
@@ -707,59 +779,155 @@ bool ServerLevel::setBlockAt(BlockPos pos, BlockStateId state, int flags, int de
         }
         preRemoveSideEffects(pos, old, std::move(*removedBlockEntity));
     }
+    // TODO: BlockBehaviour.affectNeighborsAfterRemoval (redstone components tell their neighbours).
     if (!(flags & kSkipOnPlace)) block_behaviour::onPlace(*this, pos, state, old);
+    if (getBlockState(pos) != state) return true; // (onPlace replaced it; Level.setBlock stops there)
     if (flags & kUpdateClients) markChanged(pos);
-    // TODO: neighbour *block* updates (kUpdateNeighbors: redstone, fluids, falling blocks).
-    if (!(flags & kUpdateKnownShape)) {
+    if (flags & kUpdateNeighbors) updateNeighborsAt(pos, blocks::blockOf(old)); // TODO: analog output (comparators)
+    if (!(flags & kUpdateKnownShape) && depth < 512) {
         // Level.setBlock: the old state's indirect neighbours, then the new state's direct and indirect
         // ones, with UPDATE_NEIGHBORS and UPDATE_SUPPRESS_DROPS dropped (flags & -34).
         int neighbourFlags = flags & ~(kUpdateNeighbors | kSuppressDrops);
-        block_behaviour::updateIndirectNeighbourShapes(*this, pos, old, neighbourFlags, depth);
-        updateNeighbourShapes(pos, neighbourFlags, depth);
-        block_behaviour::updateIndirectNeighbourShapes(*this, pos, state, neighbourFlags, depth);
+        block_behaviour::updateIndirectNeighbourShapes(*this, pos, old, neighbourFlags, depth + 1);
+        updateNeighbourShapes(pos, state, neighbourFlags, depth + 1);
+        block_behaviour::updateIndirectNeighbourShapes(*this, pos, state, neighbourFlags, depth + 1);
     }
     return true;
 }
 
 void ServerLevel::neighborShapeChanged(Direction toNeighbour, BlockPos pos, BlockPos neighbourPos, int flags, int depth) {
-    if (depth > 512 || pos.y < minY() || pos.y > maxY()) return;
-    BlockStateId state = getBlockState(pos);
-    BlockStateId updated = block_behaviour::updateShape(state, *this, pos, toNeighbour, neighbourPos, getBlockState(neighbourPos));
-    if (updated == state) return;
-    // Block.updateOrDestroy
-    if (blocks::isAir(updated)) destroyBlock(pos, (flags & kSuppressDrops) == 0, nullptr, flags);
-    else setBlockAt(pos, updated, flags & ~kSuppressDrops, depth + 1);
+    if (neighbourPos.y < minY() || neighbourPos.y > maxY()) return; // (nothing to read there; vanilla sees void air)
+    NeighborUpdate u{};
+    u.kind = NeighborUpdate::Kind::Shape;
+    u.pos = pos, u.neighbourPos = neighbourPos, u.direction = toNeighbour;
+    u.neighbourState = getBlockState(neighbourPos);
+    u.flags = flags, u.depth = depth;
+    addAndRun(pos, u);
 }
 
-void ServerLevel::updateNeighbourShapes(BlockPos pos, int flags, int depth) {
-    if (depth > 512) return; // Level.updateNeighbourShapes limit
+void ServerLevel::updateNeighbourShapes(BlockPos pos, BlockStateId state, int flags, int depth) {
     // BlockBehaviour.updateNeighbourShapes visits these directions in this order.
     constexpr Direction kOrder[] = {Direction::West, Direction::East, Direction::North, Direction::South, Direction::Down, Direction::Up};
-    int neighbourFlags = flags;
     for (Direction d : kOrder) {
-        BlockPos np = pos.relative(d);
-        if (np.y < minY() || np.y > maxY()) continue;
-        BlockStateId neighbour = getBlockState(np);
-        BlockStateId updated = block_behaviour::updateShape(neighbour, *this, np, direction::opposite(d), pos, getBlockState(pos));
-        if (updated == neighbour) continue;
-        // Block.updateOrDestroy
-        if (blocks::isAir(updated)) destroyBlock(np, (neighbourFlags & kSuppressDrops) == 0, nullptr, neighbourFlags);
-        else setBlockAt(np, updated, neighbourFlags & ~kSuppressDrops, depth + 1);
+        NeighborUpdate u{};
+        u.kind = NeighborUpdate::Kind::Shape;
+        u.pos = pos.relative(d), u.neighbourPos = pos, u.direction = direction::opposite(d);
+        u.neighbourState = state;
+        u.flags = flags, u.depth = depth;
+        addAndRun(u.pos, u);
     }
 }
 
-bool ServerLevel::destroyBlock(BlockPos pos, bool dropItems, const ItemStack* tool, int flags) {
+namespace {
+// NeighborUpdater.UPDATE_ORDER
+constexpr Direction kNeighbourUpdateOrder[] = {Direction::West, Direction::East, Direction::Down, Direction::Up, Direction::North, Direction::South};
+} // namespace
+
+void ServerLevel::updateNeighborsAtExceptFromFacing(BlockPos pos, uint32_t sourceBlock, std::optional<Direction> skip) {
+    NeighborUpdate u{};
+    u.kind = NeighborUpdate::Kind::Multi;
+    u.pos = pos, u.sourceBlock = sourceBlock;
+    u.skip = -1;
+    if (skip)
+        for (int8_t i = 0; i < 6; i++)
+            if (kNeighbourUpdateOrder[i] == *skip) u.skip = i;
+    u.idx = u.skip == 0 ? 1 : 0;
+    addAndRun(pos, u);
+}
+
+void ServerLevel::neighborChanged(BlockPos pos, uint32_t sourceBlock) {
+    NeighborUpdate u{};
+    u.kind = NeighborUpdate::Kind::Simple;
+    u.pos = pos, u.sourceBlock = sourceBlock;
+    addAndRun(pos, u);
+}
+
+void ServerLevel::updateNeighboursOnBlockSet(BlockPos pos, BlockStateId oldState) {
+    (void)oldState; // TODO: oldState.affectNeighborsAfterRemoval when the block changed (redstone)
+    BlockStateId state = getBlockState(pos);
+    updateNeighborsAt(pos, blocks::blockOf(state)); // TODO: analog output (comparators)
+}
+
+void ServerLevel::addAndRun(BlockPos pos, NeighborUpdate update) {
+    // CollectingNeighborUpdater.addAndRun
+    bool wasUpdating = neighborUpdateCount_ > 0;
+    bool limitReached = maxChainedNeighborUpdates >= 0 && neighborUpdateCount_ >= maxChainedNeighborUpdates;
+    neighborUpdateCount_++;
+    if (!limitReached) {
+        if (wasUpdating) addedThisLayer_.push_back(update);
+        else updateStack_.push_back(update);
+    } else if (neighborUpdateCount_ - 1 == maxChainedNeighborUpdates) {
+        log::error("Too many chained neighbor updates. Skipping the rest. First skipped position: {}, {}, {}", pos.x, pos.y, pos.z);
+    }
+    if (!wasUpdating) runNeighborUpdates();
+}
+
+void ServerLevel::runNeighborUpdates() {
+    // CollectingNeighborUpdater.runUpdates
+    struct Reset {
+        ServerLevel& l;
+        ~Reset() {
+            l.updateStack_.clear();
+            l.addedThisLayer_.clear();
+            l.neighborUpdateCount_ = 0;
+        }
+    } reset{*this};
+    while (!updateStack_.empty() || !addedThisLayer_.empty()) {
+        for (auto it = addedThisLayer_.rbegin(); it != addedThisLayer_.rend(); ++it) updateStack_.push_back(*it);
+        addedThisLayer_.clear();
+        // (the stack only changes here, so its top stays put while an update runs)
+        while (addedThisLayer_.empty()) {
+            NeighborUpdate current = updateStack_.back();
+            bool more = runNext(current);
+            updateStack_.back() = current;
+            if (!more) {
+                updateStack_.pop_back();
+                break;
+            }
+        }
+    }
+}
+
+bool ServerLevel::runNext(NeighborUpdate& u) {
+    switch (u.kind) {
+    case NeighborUpdate::Kind::Shape: { // NeighborUpdater.executeShapeUpdate
+        if (u.pos.y < minY() || u.pos.y > maxY()) return false;
+        BlockStateId current = getBlockState(u.pos);
+        if ((u.flags & kUpdateSkipShapeUpdateOnWire) && block_behaviour::isRedstoneWire(current)) return false;
+        BlockStateId updated = block_behaviour::updateShape(current, *this, u.pos, u.direction, u.neighbourPos, u.neighbourState);
+        // Block.updateOrDestroy
+        if (updated == current) return false;
+        if (blocks::isAir(updated)) destroyBlock(u.pos, (u.flags & kSuppressDrops) == 0, nullptr, u.flags, u.depth);
+        else setBlockAt(u.pos, updated, u.flags & ~kSuppressDrops, u.depth);
+        return false;
+    }
+    case NeighborUpdate::Kind::Simple: // NeighborUpdater.executeUpdate
+        if (u.pos.y >= minY() && u.pos.y <= maxY()) block_behaviour::neighborChanged(*this, u.pos, getBlockState(u.pos), u.sourceBlock);
+        return false;
+    case NeighborUpdate::Kind::Multi: { // MultiNeighborUpdate.runNext
+        BlockPos p = u.pos.relative(kNeighbourUpdateOrder[u.idx++]);
+        if (p.y >= minY() && p.y <= maxY()) block_behaviour::neighborChanged(*this, p, getBlockState(p), u.sourceBlock);
+        if (u.idx < 6 && u.idx == u.skip) u.idx++;
+        return u.idx < 6;
+    }
+    }
+    return false;
+}
+
+bool ServerLevel::destroyBlock(BlockPos pos, bool dropItems, const ItemStack* tool, int flags, int depth) {
+    (void)flags; // (always UPDATE_ALL; `flags` only decide the drops)
     BlockStateId state = getBlockState(pos);
     if (blocks::isAir(state)) return false;
-    levelEvent(2001, pos, static_cast<int>(state)); // Block.spawnDestroyParticles
+    // Block.spawnDestroyParticles (BaseFireBlock: none; StrawBedBlock: its own event)
+    if (blocks::is(state, gen::block::STRAW_BED)) levelEvent(2014, pos, static_cast<int>(state));
+    else if (!blocks::isInstance(blocks::blockOf(state), "BaseFireBlock")) levelEvent(2001, pos, static_cast<int>(state));
     if (dropItems) {
         LevelChunk& chunk = getChunk({pos.x >> 4, pos.z >> 4});
         std::optional<nbt::Compound> be;
         if (auto* b = chunk.blockEntityAt(pos.x, pos.y, pos.z)) be = b->tag;
         dropResources(state, pos, be ? &*be : nullptr, tool, nullptr);
     }
-    BlockStateId replacement = blocks::getBool(state, "waterlogged") ? blocks::defaultState(gen::block::WATER) : blocks::defaultState(gen::block::AIR);
-    return setBlock(pos, replacement, kUpdateAll); // (always UPDATE_ALL; `flags` only decide the drops)
+    return setBlockAt(pos, fluids::legacyBlock(state), kUpdateAll, depth); // FluidState.createLegacyBlock
 }
 
 void ServerLevel::dropResources(BlockStateId state, BlockPos pos, const nbt::Compound* blockEntity, const ItemStack* tool,

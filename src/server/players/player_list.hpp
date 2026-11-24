@@ -6,6 +6,7 @@
 
 #include "network/chat/component.hpp"
 #include "server/level/server_player.hpp"
+#include "server/players/user_lists.hpp"
 
 namespace mc {
 
@@ -43,6 +44,16 @@ public:
 
     void tick();
 
+    // Operators (ops.json): DedicatedPlayerList.loadOps, PlayerList.op/deop/isOp.
+    void loadOps();
+    const ServerOpList& ops() const { return ops_; }
+    bool isOp(const UUID& id) const { return ops_.contains(id); }
+    void op(const NameAndId& user);
+    void deop(const NameAndId& user);
+    // PlayerList.sendPlayerPermissionLevel: the op level as an entity event, then the command tree
+    // the player may now use.
+    void sendPlayerPermissionLevel(ServerPlayer& player);
+
     // PlayerList.saveAll: players/data/<uuid>.dat
     void saveAll();
     void save(ServerPlayer& player);
@@ -70,6 +81,7 @@ private:
     MinecraftServer& server_;
     std::vector<std::unique_ptr<ServerPlayer>> players_;
     int activePlayers_ = 0, sleepingPlayers_ = 0; // SleepStatus
+    ServerOpList ops_{"ops.json"};
 };
 
 } // namespace mc

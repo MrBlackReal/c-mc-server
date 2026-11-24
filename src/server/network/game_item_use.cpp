@@ -13,6 +13,8 @@
 #include "world/level/block/block_state.hpp"
 #include "world/level/levelgen/block_predicate.hpp"
 #include "world/level/storage/loot/loot_tables.hpp"
+#include "world/level/material/fluids.hpp"
+#include "util/mth.hpp"
 
 namespace mc {
 
@@ -196,6 +198,121 @@ UseResult ServerGamePacketListener::transformBlock(const std::string& id, ItemSt
         return UseResult::Success;
     }
     return UseResult::Pass;
+}
+
+} // namespace mc
+
+namespace mc {
+
+void ServerGamePacketListener::handleUseItem(ByteReader& in) {
+    // ServerboundUseItemPacket -> ServerGamePacketListenerImpl.handleUseItem
+    int hand = in.readVarInt();
+    int sequence = in.readVarInt();
+    float yRot = in.readFloat(), xRot = in.readFloat();
+    if (!hasClientLoaded()) return;
+    ackBlockChangesUpTo(sequence);
+    ItemStack& stack = itemInHand(hand);
+    if (stack.isEmpty()) return;
+    yRot = mth::wrapDegrees(yRot), xRot = mth::wrapDegrees(xRot);
+    if (xRot != player_.xRot || yRot != player_.yRot) player_.yRot = yRot, player_.xRot = std::clamp(xRot, -90.0f, 90.0f); // absSnapRotationTo
+    // ServerPlayerGameMode.useItem
+    if (player_.gameMode == GameType::Spectator) return;
+    std::string_view itemClass = stack.info().itemClass;
+    if (itemClass != "BucketItem" && itemClass != "MobBucketItem") return; // TODO: food, bows, potions, spawn eggs, ...
+    ItemStack transformed;
+    UseResult result = useBucket(stack, hand, transformed);
+    if (result != UseResult::Success && result != UseResult::SuccessServer) return;
+    // (InteractionResult.heldItemTransformedTo; the menu is resent only if the held stack changed)
+    if (!ItemStack::matches(transformed, stack)) {
+        stack = transformed;
+        player_.inventoryMenu->sendAllDataToRemote();
+    }
+    swing(hand, result == UseResult::SuccessServer); // (SUCCESS: the user's client swung already)
+}
+
+UseResult ServerGamePacketListener::useBucket(ItemStack& stack, int hand, ItemStack& transformedTo) {
+    // BucketItem.use
+    (void)hand;
+    ServerLevel& level = player_.level();
+    std::string_view id = items::name(stack.item);
+    uint8_t content = id == "minecraft:bucket" ? fluids::kEmpty : id == "minecraft:lava_bucket" ? fluids::kLava : fluids::kWater;
+    // Item.getPlayerPOVHitResult: from the eyes along the view vector, as far as the player reaches.
+    constexpr float kDeg = 3.14159265358979323846f / 180.0f;
+    float f = player_.xRot * kDeg, g = -player_.yRot * kDeg;
+    float h = mth::cos(g), i = mth::sin(g), j = mth::cos(f), k = mth::sin(f);
+    double range = player_.blockInteractionRange();
+    double ex = player_.x, ey = player_.eyeY(), ez = player_.z;
+    auto hit = level.clip(ex, ey, ez, ex + i * j * range, ey - k * range, ez + h * j * range, ServerLevel::ClipBlock::Outline,
+                          content == fluids::kEmpty ? ServerLevel::ClipFluid::SourceOnly : ServerLevel::ClipFluid::None);
+    if (!hit) return UseResult::Pass;
+    BlockPos pos = hit->pos;
+    BlockPos placePos = pos.relative(hit->direction);
+    // Level.mayInteract (no spawn protection yet) / Player.mayUseItemAt. TODO: adventure mode's can_place_on
+    if (!canModifyWorld(player_.gameMode)) return UseResult::Pass;
+    auto filledResult = [&](ItemStack filled) { // ItemUtils.createFilledResult
+        if (player_.hasInfiniteMaterials()) {
+            bool has = false;
+            for (int s = 0; s <= Inventory::kOffhandSlot; s++)
+                if (!player_.inventory.slot(s).isEmpty() && ItemStack::isSameItemSameComponents(player_.inventory.slot(s), filled)) has = true;
+            if (!has) player_.inventory.add(filled);
+            return stack;
+        }
+        ItemStack rest = stack;
+        rest.shrink(1);
+        if (rest.isEmpty()) return filled;
+        giveOrDrop(std::move(filled));
+        return rest;
+    };
+    if (content == fluids::kEmpty) {
+        BlockStateId state = level.getBlockState(pos);
+        if (!fluids::info::isBucketPickup(state)) return UseResult::Pass; // (FAIL)
+        std::string_view sound;
+        auto taken = fluids::pickupBlock(level, pos, state, &sound);
+        if (!taken) return UseResult::Pass;
+        if (!sound.empty()) // Player.playSound: at the player, for everyone else
+            level.playSound(player_.id(), player_.x, player_.y, player_.z, registries::id("minecraft:sound_event", sound).value_or(-1),
+                            ServerLevel::kSoundSourcePlayers, 1.0f, 1.0f);
+        transformedTo = filledResult(ItemStack(*items::byName(*taken), 1));
+        return UseResult::Success;
+    }
+    BlockStateId clicked = level.getBlockState(pos);
+    BlockPos target = fluids::info::isLiquidBlockContainer(clicked) && content == fluids::kWater ? pos : placePos;
+    if (!emptyBucketContents(content, target, hit)) return UseResult::Pass; // (FAIL)
+    // TODO: MobBucketItem.checkExtraContent (the fish comes out, once there are mobs)
+    // BucketItem.getEmptySuccessItem, through ItemUtils.createFilledResult
+    transformedTo = filledResult(player_.hasInfiniteMaterials() ? stack : ItemStack(*items::byName("minecraft:bucket"), 1));
+    return UseResult::Success;
+}
+
+bool ServerGamePacketListener::emptyBucketContents(uint8_t content, BlockPos pos, const std::optional<ServerLevel::BlockHit>& hit) {
+    // BucketItem.emptyContents
+    ServerLevel& level = player_.level();
+    BlockStateId state = level.getBlockState(pos);
+    bool canBeReplaced = fluids::info::canBeReplacedBy(state, content);
+    bool placeLiquid = canBeReplaced || (fluids::info::isLiquidBlockContainer(state) && fluids::info::canPlaceLiquid(state, content));
+    // (sneaking: into the block next to it unless already there)
+    bool canPlaceFluidInsideBlock = bs::isAir(state) || (placeLiquid && (!player_.sneaking || !hit));
+    auto playEmptySound = [&] {
+        level.playBlockSound(player_.id(), pos, soundId(fluids::isLava(content) ? "minecraft:item.bucket.empty_lava" : "minecraft:item.bucket.empty"), 1.0f, 1.0f);
+    };
+    if (!canPlaceFluidInsideBlock) return hit && emptyBucketContents(content, hit->pos.relative(hit->direction), std::nullopt);
+    if (level.waterEvaporates() && fluids::isWater(content)) {
+        std::uniform_real_distribution<float> u(0.0f, 1.0f);
+        auto& r = level.random();
+        level.playSound(player_.id(), pos.x + 0.5, pos.y + 0.5, pos.z + 0.5, soundId("minecraft:block.fire.extinguish"), ServerLevel::kSoundSourceBlocks, 0.5f,
+                        2.6f + (u(r) - u(r)) * 0.8f);
+        level.sendParticles("minecraft:large_smoke", pos.x, pos.y, pos.z, 8, 1.0f, 1.0f, 1.0f, 0.0f); // TODO: RandomizationType.ALTERNATIVE
+        return true;
+    }
+    if (fluids::info::isLiquidBlockContainer(state) && content == fluids::kWater) {
+        fluids::placeLiquid(level, pos, state, fluids::source(content));
+        playEmptySound();
+        return true;
+    }
+    if (canBeReplaced && !bs::isInstance(bs::blockOf(state), "LiquidBlock")) level.destroyBlock(pos, true);
+    if (!level.setBlock(pos, fluids::legacyBlock(fluids::source(content)), ServerLevel::kUpdateAll | 8) && !fluids::stateOf(state).isSource()) return false;
+    playEmptySound();
+    return true;
 }
 
 } // namespace mc

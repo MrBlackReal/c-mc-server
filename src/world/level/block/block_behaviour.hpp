@@ -61,6 +61,9 @@ bool fireCanBePlacedAt(ServerLevel& level, BlockPos pos);
 // BlockBehaviour.updateShape: new state for `state` at `pos` after its neighbour changed.
 BlockStateId updateShape(BlockStateId state, ServerLevel& level, BlockPos pos, Direction toNeighbour, BlockPos neighbourPos,
                          BlockStateId neighbourState);
+// BlockBehaviour.neighborChanged: a neighbour of `pos` changed (`sourceBlock` is what it was).
+void neighborChanged(ServerLevel& level, BlockPos pos, BlockStateId state, uint32_t sourceBlock);
+bool isRedstoneWire(BlockStateId state);
 // BlockBehaviour.updateIndirectNeighbourShapes (redstone wire: wires one step up or down).
 void updateIndirectNeighbourShapes(ServerLevel& level, BlockPos pos, BlockStateId state, int flags, int depth);
 // CampfireBlock.isSmokeyPos: smoke from a lit campfire up to 5 blocks below reaches `pos`.

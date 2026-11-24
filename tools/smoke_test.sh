@@ -11,6 +11,7 @@ trap 'kill $SERVER 2>/dev/null || true; wait $SERVER 2>/dev/null || true; rm -rf
 cd "$WORK"
 echo "eula=true" > eula.txt
 printf 'server-port=%s\nonline-mode=false\n' "$PORT" > server.properties
+python3 "$ROOT/tools/ops_json.py" Alice Bob > ops.json # (the tests use op commands)
 "$BIN" < /dev/null > server.log 2>&1 &
 SERVER=$!
 for _ in $(seq 50); do grep -q "Done (" server.log && break; sleep 0.1; done
