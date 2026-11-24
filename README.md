@@ -161,18 +161,46 @@ obvious counterpart to compare against:
   dedicated server's `/op`, `/deop`, `/save-all`, `/stop`. Operators are kept in `ops.json` (with
   `op-permission-level`), names in `usercache.json`; signed arguments for every command that has them
 
+**Milestone 6: redstone** ✅
+- Signals as in vanilla's `SignalGetter` (weak and strong power, conductors, quasi-connectivity),
+  and redstone wire with vanilla's default evaluator, including its update order
+- Power sources: redstone blocks, torches (they burn out when toggled too often), levers, buttons
+  (wood and stone timings), pressure plates (stone, wood, weighted: items and players on them),
+  observers, repeaters (delays, locking), comparators (compare and subtract, reading containers,
+  cauldrons, cake, composters, jukeboxes, lecterns, bookshelves, ... also through a block),
+  daylight detectors (sky light and the sun's eased angle), tripwire hooks and tripwire (shears
+  disarm it), trapped chests, lecterns turning pages
+- Things that react: lamps, copper bulbs, doors, trapdoors, fence gates, note blocks, bells,
+  hoppers (locked), powered and activator rails, rails reshaping at junctions, heads
+- Pistons and sticky pistons: vanilla's structure resolver (12 blocks, slime and honey blocks,
+  immovable and breakable blocks), moving blocks as block entities that tick in vanilla's order
+  and are saved, short pulses (sticky pistons dropping their block), quasi-connectivity; items
+  and experience orbs in the way are pushed
+- Hoppers move items (cooldowns, the hand-over between hoppers, pulling from containers above and
+  picking up items), into and out of chests (both halves), barrels, shulker boxes, furnaces and
+  brewing stands (through the right faces), dispensers, droppers, crafters and composters
+- Droppers drop items or put them into the container in front; dispensers place and pick up
+  water and lava (and powder snow), light fires and candles, bone meal crops, shear beehives, fill
+  bottles, charge respawn anchors, wax copper, make mud, place shulker boxes and put armour on
+  players, and drop everything else
+- Block events run in the level tick like vanilla (queued, deduplicated); block entity tickers keep
+  vanilla's order. `tools/test_redstone.py`, `test_pistons.py` and `test_hoppers.py` end with every
+  block (and every state each block went through) identical to vanilla's
+
 Known gaps: bone meal on grass, moss, nylium, fungi and flowers (they place world-gen features);
 turtle eggs don't hatch and dried ghasts stay hydrated (no mobs); no food/hunger, mobs,
-explosions, portals, weather, maps (cartography table) or redstone (so nothing reacts to
-`neighborChanged` but fluids and sponges); fish buckets release no fish; dispensers don't
-use buckets (they need redstone); Haste/Mining Fatigue
-don't affect dig speed; the anvil compares a typed name with the item's name key, not its English
-text.
+explosions (so no TNT), portals, weather, maps (cartography table); fish buckets release no
+fish; dispensers don't shoot projectiles or place boats, minecarts, armor stands, spawn eggs or
+TNT (no such entities yet: those items stay in the dispenser); the crafter doesn't craft on a
+signal yet; hoppers don't feed jukeboxes, chiseled bookshelves, decorated pots or shelves; no
+minecarts (detector rails), projectiles (target blocks, wooden buttons pressed by arrows), sculk
+sensors, lightning rods or command blocks; Haste/Mining Fatigue don't affect dig speed; the anvil
+compares a typed name with the item's name key, not its English text.
 
 **Next milestones**
-1. Redstone
-2. Nether/End, entities, AI, physics (swimming); noise world generation; the rest
-   of the commands; using items in the air (food, bows, potions, spawn eggs)
+1. Entities: mobs, AI, projectiles, TNT and explosions, minecarts
+2. Nether/End, physics (swimming); noise world generation; the rest of the commands; using items
+   in the air (food, bows, potions, spawn eggs)
 
 Known shortcuts are marked `TODO` in the source.
 
@@ -223,6 +251,11 @@ tools/run_test.sh tools/test_bone_meal.py       # trees, crops, huge mushrooms f
 tools/run_test.sh tools/test_fluids.py          # flowing, sources, lava and water, sponges, buckets
 FLUID_DUMP=out.json tools/run_test.sh tools/test_fluids.py  # + every block changed, to diff with vanilla's
 tools/run_test.sh tools/test_fluid_entities.py  # items drifting, floating and burning
+tools/run_test.sh tools/test_redstone.py        # wire, torches, diodes, plates, tripwire, daylight
+tools/run_test.sh tools/test_pistons.py         # pushing, pulling, slime blocks, short pulses
+tools/run_test.sh tools/test_hoppers.py         # hoppers, droppers and dispensers
+REDSTONE_DUMP=out.txt tools/run_test.sh tools/test_redstone.py  # + every block and its history, to diff
+                                                # with vanilla's (PISTON_DUMP, HOPPER_DUMP likewise)
 BUNDLE=<unzipped jar> tools/feature_check.sh    # trees/huge mushrooms vs vanilla's code, same seeds
 tools/test_online.sh                            # online-mode logins, both servers, stand-in services
 tools/test_chat.sh                              # secure chat with enforce-secure-profile, both servers

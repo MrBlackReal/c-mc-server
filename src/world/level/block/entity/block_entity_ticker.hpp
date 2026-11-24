@@ -35,6 +35,8 @@ std::string songOf(const ItemStack& stack);
 void insert(ServerLevel& level, BlockPos pos, BlockStateId state, nbt::Compound& be, const ItemStack& disc);
 // JukeboxBlockEntity.popOutTheItem: the disc jumps out and the song stops.
 void popOut(ServerLevel& level, BlockPos pos, nbt::Compound& be);
+// JukeboxBlockEntity.getComparatorOutput for the disc `stack`.
+int comparatorOutput(const ItemStack& stack);
 } // namespace jukebox
 
 } // namespace mc::block_entity

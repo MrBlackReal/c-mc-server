@@ -1,4 +1,5 @@
 #include "world/level/block/entity/block_entity_ticker.hpp"
+#include "world/level/block/redstone_blocks.hpp"
 
 #include <cmath>
 #include <random>
@@ -48,11 +49,18 @@ std::string recordSong(const nbt::Compound& be) {
     return stack ? jukebox::songOf(*stack) : std::string();
 }
 
+// JukeboxBlockEntity.onSongChanged: redstone around it hears about it (and comparators via setChanged).
+void onSongChanged(ServerLevel& level, BlockPos pos) {
+    level.updateNeighborsAt(pos, bs::blockOf(level.getBlockState(pos)));
+    level.blockEntitySetChanged(pos);
+}
+
 // JukeboxSongPlayer.stop
 void stopSong(ServerLevel& level, BlockPos pos, nbt::Compound& be) {
     if (!be.contains("ticks_since_song_started")) return;
     be.remove("ticks_since_song_started");
     level.levelEvent(1011, pos, 0);
+    onSongChanged(level, pos);
 }
 
 // JukeboxSongPlayer.tick
@@ -368,7 +376,8 @@ bool tickBeacon(ServerLevel& level, BlockPos pos, nbt::Compound& be) {
 void forgetBeacon(ServerLevel& level, BlockPos pos) { g_beacons[&level].erase(pos.asLong()); }
 
 bool hasTicker(std::string_view type) {
-    return type == "minecraft:jukebox" || type == "minecraft:brewing_stand" || type == "minecraft:beacon" || BlockEntityContainer::isFurnace(type);
+    return type == "minecraft:jukebox" || type == "minecraft:brewing_stand" || type == "minecraft:beacon" || BlockEntityContainer::isFurnace(type) ||
+           type == "minecraft:hopper" || type == "minecraft:daylight_detector";
 }
 
 bool tick(ServerLevel& level, BlockPos pos, BlockStateId state, nbt::Compound& be) {
@@ -377,6 +386,10 @@ bool tick(ServerLevel& level, BlockPos pos, BlockStateId state, nbt::Compound& b
     if (BlockEntityContainer::isFurnace(type)) return tickFurnace(level, pos, state, be);
     if (type == "minecraft:brewing_stand") return tickBrewingStand(level, pos, state, be);
     if (type == "minecraft:beacon") return tickBeacon(level, pos, be);
+    if (type == "minecraft:daylight_detector") { // DaylightDetectorBlock.tickEntity
+        if (level.gameTime() % 20 == 0) block_behaviour::redstone_blocks::daylightUpdate(level, pos, state);
+        return false;
+    }
     return false;
 }
 
@@ -410,6 +423,14 @@ void insert(ServerLevel& level, BlockPos pos, BlockStateId state, nbt::Compound&
     if (song.empty()) return;
     be.put("ticks_since_song_started", int64_t{0}); // JukeboxSongPlayer.play
     level.levelEvent(1010, pos, registries::id("minecraft:jukebox_song", song).value_or(0));
+    onSongChanged(level, pos);
+}
+
+int comparatorOutput(const ItemStack& stack) {
+    std::string song = songOf(stack);
+    if (song.empty()) return 0;
+    const json::Value& def = songs()[song];
+    return def.isObject() ? static_cast<int>(def["comparator_output"].number()) : 0;
 }
 
 void popOut(ServerLevel& level, BlockPos pos, nbt::Compound& be) {
@@ -423,6 +444,7 @@ void popOut(ServerLevel& level, BlockPos pos, nbt::Compound& be) {
     std::uniform_real_distribution<float> u(0.0f, 1.0f);
     double x = pos.x + 0.5 + (u(level.random()) * 2.0f - 1.0f) * 0.7f, z = pos.z + 0.5 + (u(level.random()) * 2.0f - 1.0f) * 0.7f;
     if (ItemEntity* e = ItemEntity::spawn(level, x, pos.y + 1.01, z, std::move(*disc), level.random())) e->pickupDelay = ItemEntity::kDefaultPickupDelay;
+    onSongChanged(level, pos);
 }
 
 } // namespace jukebox

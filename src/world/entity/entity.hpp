@@ -72,6 +72,14 @@ public:
     double fluidHeight(bool lava) const { return fluidHeight_[lava ? 1 : 0]; }
     bool isEyeInFluid(bool lava) const { return eyeInFluid_[lava ? 1 : 0]; }
 
+    // Entity.move(MoverType.PISTON) and applyEffectsFromBlocks over the move: a moving piston
+    // shoves the entity.
+    void moveByPiston(ServerLevel& level, double dx, double dy, double dz) {
+        double fx = x, fy = y, fz = z;
+        move(level, dx, dy, dz);
+        applyEffectsFromBlocks(level, fx, fy, fz);
+    }
+
     // ServerEntity bookkeeping.
     bool needsSync = false;   // velocity changed a lot since the last update
     bool dataChanged = false; // entity data changed since it was sent

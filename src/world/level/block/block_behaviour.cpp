@@ -12,6 +12,10 @@
 #include "generated/behaviour.hpp"
 #include "server/level/server_level.hpp"
 #include "world/level/material/fluids.hpp"
+#include "world/level/block/redstone_blocks.hpp"
+#include "world/level/block/piston.hpp"
+#include "world/level/block/dispenser.hpp"
+#include "world/level/redstone/redstone.hpp"
 #include "util/json.hpp"
 #include "world/entity/falling_block_entity.hpp"
 #include "world/item/item_logic.hpp"
@@ -223,7 +227,7 @@ std::string_view doorHinge(const PlaceContext& ctx) {
 bool needsSupport(uint32_t b) {
     return isA(b, "VegetationBlock") || isA(b, "BaseTorchBlock") || isA(b, "FaceAttachedHorizontalDirectionalBlock") ||
            isA(b, "LadderBlock") || isA(b, "CarpetBlock") || isA(b, "DoorBlock") || isA(b, "BasePressurePlateBlock") ||
-           isA(b, "BaseRailBlock") || isA(b, "SignBlock") || isA(b, "BannerBlock") || isA(b, "WallBannerBlock") ||
+           isA(b, "SignBlock") || isA(b, "BannerBlock") || isA(b, "WallBannerBlock") ||
            isA(b, "SnowLayerBlock") || isA(b, "DiodeBlock") || isA(b, "RedstoneWireBlock") || isA(b, "CandleBlock") ||
            isA(b, "AmethystClusterBlock") || isA(b, "BaseCoralWallFanBlock") || isA(b, "BaseCoralPlantTypeBlock") ||
            isA(b, "BellBlock") || isA(b, "CocoaBlock") || isA(b, "TripWireHookBlock") || isA(b, "ShelfMushroomBlock") || isA(b, "CakeBlock") ||
@@ -550,64 +554,13 @@ bool bellCanSurvive(BlockStateId s, ServerLevel& level, BlockPos pos) {
 
 // ---------------------------------------------------------------- redstone wire connections (RedstoneWireBlock)
 
-bool wireShouldConnectTo(BlockStateId st, std::optional<Direction> dir) { // shouldRedstoneWireConnectTo
-    uint32_t b = bs::blockOf(st);
-    if (isA(b, "RedstoneWireBlock")) return true;
-    if (isA(b, "RepeaterBlock")) {
-        Direction f = dirValue(st, "facing");
-        return dir && (f == *dir || direction::opposite(f) == *dir);
-    }
-    if (isA(b, "ObserverBlock")) return dir && dirValue(st, "facing") == *dir;
-    return (bs::flags(st) & bs::kSignalSource) && dir.has_value();
-}
-bool wireCanSurviveOn(BlockStateId st) { return bs::isFaceSturdy(st, Direction::Up) || bs::is(st, HOPPER); }
+bool wireCanSurviveOn(BlockStateId st) { return redstone::wire::canSurviveOn(st); }
 bool conductor(BlockStateId st) { return bs::flags(st) & bs::kRedstoneConductor; }
-
-std::string_view wireConnectingSide(ServerLevel& level, BlockPos pos, Direction dir, bool canConnectUp) {
-    BlockPos rp = pos.relative(dir);
-    BlockStateId rs = level.getBlockState(rp);
-    if (canConnectUp) {
-        bool placeableAbove = isA(rs, "TrapDoorBlock", 0) || wireCanSurviveOn(rs);
-        if (placeableAbove && wireShouldConnectTo(level.getBlockState(rp.above()), std::nullopt))
-            return bs::isFaceSturdy(rs, direction::opposite(dir)) ? "up" : "side";
-    }
-    bool none = !wireShouldConnectTo(rs, dir) && (conductor(rs) || !wireShouldConnectTo(level.getBlockState(rp.below()), std::nullopt));
-    return none ? "none" : "side";
-}
-std::string_view wireConnectingSide(ServerLevel& level, BlockPos pos, Direction dir) {
-    return wireConnectingSide(level, pos, dir, !conductor(level.getBlockState(pos.above())));
-}
-bool wireConnected(BlockStateId s, Direction d) { return bs::getValue(s, dirName(d)) != "none"; }
-bool wireIsDot(BlockStateId s) {
-    for (Direction d : direction::kHorizontal)
-        if (wireConnected(s, d)) return false;
-    return true;
-}
-bool wireIsCross(BlockStateId s) {
-    for (Direction d : direction::kHorizontal)
-        if (!wireConnected(s, d)) return false;
-    return true;
-}
-BlockStateId wireCross(BlockStateId s) { // crossState with the same power
-    for (Direction d : direction::kHorizontal) s = bs::setValue(s, dirName(d), "side");
-    return s;
-}
-BlockStateId wireConnectionState(ServerLevel& level, BlockStateId s, BlockPos pos) { // getConnectionState
-    bool wasDot = wireIsDot(s);
-    BlockStateId st = bs::setValue(bs::defaultState(bs::blockOf(s)), "power", std::string(bs::getValue(s, "power").value_or("0")));
-    bool canConnectUp = !conductor(level.getBlockState(pos.above()));
-    for (Direction d : direction::kHorizontal) // getMissingConnections
-        if (!wireConnected(st, d)) st = bs::setValue(st, dirName(d), wireConnectingSide(level, pos, d, canConnectUp));
-    if (wasDot && wireIsDot(st)) return st;
-    bool n = wireConnected(st, Direction::North), so = wireConnected(st, Direction::South);
-    bool e = wireConnected(st, Direction::East), w = wireConnected(st, Direction::West);
-    bool nsEmpty = !n && !so, ewEmpty = !e && !w;
-    if (!w && nsEmpty) st = bs::setValue(st, "west", "side");
-    if (!e && nsEmpty) st = bs::setValue(st, "east", "side");
-    if (!n && ewEmpty) st = bs::setValue(st, "north", "side");
-    if (!so && ewEmpty) st = bs::setValue(st, "south", "side");
-    return st;
-}
+bool wireConnected(BlockStateId s, Direction d) { return redstone::wire::connected(s, d); }
+bool wireIsCross(BlockStateId s) { return redstone::wire::isCross(s); }
+BlockStateId wireCross(BlockStateId s) { return redstone::wire::crossState(s); }
+BlockStateId wireConnectionState(ServerLevel& level, BlockStateId s, BlockPos pos) { return redstone::wire::connectionState(level, s, pos); }
+std::string_view wireConnectingSide(ServerLevel& level, BlockPos pos, Direction dir) { return redstone::wire::connectingSide(level, pos, dir); }
 
 // ---------------------------------------------------------------- rails (RailState)
 
@@ -742,6 +695,11 @@ struct RailState {
             }
         }
     }
+    int countPotentialConnections() {
+        int count = 0;
+        for (Direction d : direction::kHorizontalPlane) count += hasRail(pos.relative(d));
+        return count;
+    }
 };
 
 bool updatePlacementContext(PlaceContext& ctx) {
@@ -773,7 +731,15 @@ bool updatePlacementContext(PlaceContext& ctx) {
     return false;
 }
 
+std::optional<BlockStateId> getStateForPlacementOwn(uint32_t block, const PlaceContext& ctx);
+
 std::optional<BlockStateId> getStateForPlacement(uint32_t block, const PlaceContext& ctx) {
+    auto s = getStateForPlacementOwn(block, ctx);
+    if (s) s = redstone_blocks::placementState(block, *s, ctx.level, ctx.pos);
+    return s;
+}
+
+std::optional<BlockStateId> getStateForPlacementOwn(uint32_t block, const PlaceContext& ctx) {
     ServerLevel& level = ctx.level;
     BlockPos pos = ctx.pos;
     BlockStateId s = bs::defaultState(block);
@@ -1418,6 +1384,8 @@ BlockStateId updateShapeOwn(BlockStateId s, ServerLevel& level, BlockPos pos, Di
     if (isA(b, "NoteBlock") && direction::axis(toNeighbour) == Axis::Y) return noteBlockInstrument(level, pos, s);
     if (isA(b, "FireBlock")) return canSurvive(s, level, pos) ? fireWithAge(level, pos, intValue(s, "age")) : air;
     if (isA(b, "SoulFireBlock")) return canSurvive(s, level, pos) ? bs::defaultState(b) : air;
+    if (auto r = redstone_blocks::updateShape(s, level, pos, toNeighbour, neighbour)) return *r;
+    if (b == PISTON_HEAD) return direction::opposite(toNeighbour) == dirValue(s, "facing") && !piston::headCanSurvive(level, pos, s) ? air : s;
     if (isA(b, "RedstoneWireBlock")) {
         if (toNeighbour == Direction::Down) return wireCanSurviveOn(neighbour) ? s : air;
         if (toNeighbour == Direction::Up) return wireConnectionState(level, s, pos);
@@ -1776,16 +1744,29 @@ void spongeTryAbsorbWater(ServerLevel& level, BlockPos start) {
 
 bool isRedstoneWire(BlockStateId state) { return isA(state, "RedstoneWireBlock", 0); }
 
-void neighborChanged(ServerLevel& level, BlockPos pos, BlockStateId state, uint32_t sourceBlock) {
-    (void)sourceBlock;
+void neighborChanged(ServerLevel& level, BlockPos pos, BlockStateId state, uint32_t sourceBlock, bool movedByPiston) {
     uint32_t b = bs::blockOf(state);
     if (isA(b, "LiquidBlock")) return fluids::liquidNeighborChanged(level, pos, state);
     if (b == SPONGE) return spongeTryAbsorbWater(level, pos);
-    // TODO: redstone components (doors, trapdoors, gates, note blocks, rails, TNT, ...), frosted ice
+    if (piston::isPistonBase(b)) return piston::checkIfExtend(level, pos, state);
+    if (b == PISTON_HEAD) return piston::headNeighborChanged(level, pos, state, sourceBlock);
+    if (isA(b, "DispenserBlock")) return dispenser::neighborChanged(level, pos, state);
+    redstone_blocks::neighborChanged(level, pos, state, sourceBlock, movedByPiston);
+    // TODO: TNT, crafters, frosted ice
 }
 
-void onPlace(ServerLevel& level, BlockPos pos, BlockStateId state, BlockStateId old) {
+void affectNeighborsAfterRemoval(ServerLevel& level, BlockPos pos, BlockStateId state, bool movedByPiston) {
+    if (bs::is(state, PISTON_HEAD)) return piston::headAffectNeighborsAfterRemoval(level, pos, state);
+    redstone_blocks::affectNeighborsAfterRemoval(level, pos, state, movedByPiston);
+}
+
+void onPlace(ServerLevel& level, BlockPos pos, BlockStateId state, BlockStateId old, bool movedByPiston) {
     uint32_t b = bs::blockOf(state);
+    if (redstone_blocks::onPlace(level, pos, state, old, movedByPiston)) return;
+    if (piston::isPistonBase(b)) {
+        if (bs::blockOf(old) != b) piston::checkIfExtend(level, pos, state);
+        return;
+    }
     if (isA(b, "LiquidBlock")) return fluids::liquidOnPlace(level, pos, state);
     if (b == SPONGE && bs::blockOf(old) != b) return spongeTryAbsorbWater(level, pos);
     if (isA(b, "FallingBlock")) level.scheduleTick(pos, b, fallDelay(b));
@@ -1809,12 +1790,14 @@ BlockStateId updateFromNeighbourShapes(BlockStateId state, ServerLevel& level, B
 
 bool hasTick(uint32_t block) {
     return isA(block, "ComposterBlock") || block == FIRE || isA(block, "FallingBlock") || isA(block, "LecternBlock") || isA(block, "LiquidBlock") ||
-           block == BUBBLE_COLUMN || detail::hasPlantTick(block);
+           block == BUBBLE_COLUMN || detail::hasPlantTick(block) || redstone_blocks::hasTick(block) || isA(block, "DispenserBlock");
 }
 
 void tick(ServerLevel& level, BlockPos pos, BlockStateId s) {
     uint32_t b = bs::blockOf(s);
     if (detail::plantTick(level, pos, s)) return;
+    if (redstone_blocks::tick(level, pos, s)) return;
+    if (isA(b, "DispenserBlock")) return dispenser::tick(level, pos, s);
     if (isA(b, "LiquidBlock")) return fluids::liquidTick(level, pos, s);
     if (b == BUBBLE_COLUMN) return fluids::bubbleColumnTick(level, pos, s);
     if (b == FIRE) return fireTick(level, pos, s);
@@ -1824,10 +1807,7 @@ void tick(ServerLevel& level, BlockPos pos, BlockStateId s) {
         if (free && pos.y >= level.minY()) FallingBlockEntity::fall(level, pos, s);
         return;
     }
-    if (isA(b, "LecternBlock")) { // LecternBlock.tick: the page-turn pulse ends
-        if (bs::getBool(s, "powered")) level.setBlock(pos, bs::setBool(s, "powered", false));
-        return;
-    }
+    if (isA(b, "LecternBlock")) return redstone_blocks::lecternTick(level, pos, s); // the page-turn pulse ends
     if (isA(b, "ComposterBlock") && bs::getValue(s, "level") == "7") { // the compost is ready
         level.setBlock(pos, bs::setValue(s, "level", "8"));
         static const int32_t kReady = registries::id("minecraft:sound_event", "minecraft:block.composter.ready").value_or(-1);
@@ -1837,10 +1817,8 @@ void tick(ServerLevel& level, BlockPos pos, BlockStateId s) {
 
 void setPlacedBy(ServerLevel& level, BlockPos pos, BlockStateId s) {
     uint32_t b = bs::blockOf(s);
-    if (isA(b, "BaseRailBlock")) { // BaseRailBlock.onPlace -> updateDir (no redstone signals yet)
-        RailState(level, pos, s).place(false, true, bs::getValue(s, "shape").value_or("north_south"));
-        return;
-    }
+    redstone_blocks::setPlacedBy(level, pos, s);
+    if (piston::isPistonBase(b)) piston::checkIfExtend(level, pos, s);
     if (isA(b, "DoorBlock") || isA(b, "DoublePlantBlock")) {
         BlockStateId upper = bs::setValue(s, "half", "upper");
         if (bs::hasProperty(upper, "waterlogged")) upper = bs::setBool(upper, "waterlogged", bs::isWaterSource(level.getBlockState(pos.above())));
@@ -1859,7 +1837,7 @@ bool useWithoutItem(ServerLevel& level, BlockPos pos, BlockStateId s, float play
         level.playBlockSound(playerId, pos, open ? beh.openSound : beh.closeSound, 1.0f, unit(level.random()) * 0.1f + 0.9f);
     };
     // Iron doors/trapdoors can only be opened by redstone (BlockSetType.canOpenByHand).
-    if ((isA(b, "DoorBlock") && b != IRON_DOOR) || (isA(b, "TrapDoorBlock") && b != IRON_TRAPDOOR)) {
+    if ((isA(b, "DoorBlock") || isA(b, "TrapDoorBlock")) && beh.openByHand) {
         bool open = !bs::getBool(s, "open");
         level.setBlock(pos, bs::setBool(s, "open", open));
         openCloseSound(open);
@@ -1877,38 +1855,7 @@ bool useWithoutItem(ServerLevel& level, BlockPos pos, BlockStateId s, float play
         openCloseSound(bs::getBool(s, "open"));
         return true;
     }
-    if (isA(b, "LeverBlock")) {
-        bool powered = !bs::getBool(s, "powered");
-        level.setBlock(pos, bs::setBool(s, "powered", powered));
-        static const int32_t kLeverClick = registries::id("minecraft:sound_event", "minecraft:block.lever.click").value_or(-1);
-        level.playBlockSound(playerId, pos, kLeverClick, 0.3f, powered ? 0.6f : 0.5f); // LeverBlock.playSound
-        return true; // TODO: redstone power propagation
-    }
-    // Adjustable redstone components (their redstone behaviour isn't ported yet).
-    if (isA(b, "RepeaterBlock") && mayBuild) {
-        int delay = std::stoi(std::string(bs::getValue(s, "delay").value_or("1")));
-        level.setBlock(pos, bs::setValue(s, "delay", std::to_string(delay % 4 + 1)));
-        return true;
-    }
-    if (isA(b, "ComparatorBlock") && mayBuild) {
-        bool subtract = bs::getValue(s, "mode") != "subtract";
-        level.setBlock(pos, bs::setValue(s, "mode", subtract ? "subtract" : "compare"));
-        static const int32_t kClick = registries::id("minecraft:sound_event", "minecraft:block.comparator.click").value_or(-1);
-        level.playBlockSound(playerId, pos, kClick, 0.3f, subtract ? 0.55f : 0.5f);
-        return true;
-    }
-    if (isA(b, "DaylightDetectorBlock") && mayBuild) {
-        level.setBlock(pos, bs::setBool(s, "inverted", !bs::getBool(s, "inverted")));
-        return true;
-    }
-    if (isA(b, "RedstoneWireBlock") && mayBuild && (wireIsCross(s) || wireIsDot(s))) { // toggle dot <-> cross
-        BlockStateId n = wireIsCross(s) ? bs::setValue(bs::defaultState(b), "power", std::string(bs::getValue(s, "power").value_or("0"))) : wireCross(s);
-        n = wireConnectionState(level, n, pos);
-        if (n != s) {
-            level.setBlock(pos, n);
-            return true;
-        }
-    }
+    if (auto r = redstone_blocks::use(level, pos, s, playerId, mayBuild)) return *r;
     if (isA(b, "NoteBlock")) { // cycle the note, then play it
         auto note = bs::getValue(s, "note").value_or("0");
         int next = (std::stoi(std::string(note)) + 1) % 25;
@@ -1920,8 +1867,8 @@ bool useWithoutItem(ServerLevel& level, BlockPos pos, BlockStateId s, float play
     // Blocks with a use in vanilla that isn't ported yet: they still consume the click, so using
     // them doesn't place a block against them. (Container menus, beds, lecterns and the like are
     // handled by the packet listener before this.)
-    // TODO: the cartography table (maps), bells, buttons (redstone) and command blocks.
-    static constexpr std::string_view kInteractive[] = {"CartographyTableBlock", "BellBlock", "ButtonBlock", "CommandBlock"};
+    // TODO: the cartography table (maps), bells (rung by hand) and command blocks.
+    static constexpr std::string_view kInteractive[] = {"CartographyTableBlock", "BellBlock", "CommandBlock"};
     for (auto cls : kInteractive)
         if (isA(b, cls)) return true;
     return false;
@@ -1936,6 +1883,8 @@ bool triggerEvent(ServerLevel& level, BlockPos pos, BlockStateId s, int b0, int 
     if (isA(bs::blockOf(s), "DecoratedPotBlock")) return b0 == 1 && b1 >= 0 && b1 < 2;
     // Chest, ender chest and shulker box lids (the viewer count).
     if (isA(bs::blockOf(s), "ChestBlock") || isA(bs::blockOf(s), "EnderChestBlock") || isA(bs::blockOf(s), "ShulkerBoxBlock")) return b0 == 1;
+    if (isA(bs::blockOf(s), "BellBlock")) return b0 == 1; // BellBlockEntity.triggerEvent: it swings
+    if (piston::isPistonBase(bs::blockOf(s))) return piston::triggerEvent(level, pos, s, b0, b1);
     if (!isA(bs::blockOf(s), "NoteBlock")) return false;
     const auto& inst = instrumentOf(s);
     float pitch = 1.0f;
@@ -1966,6 +1915,33 @@ bool isValidSpeleothemPlacement(uint32_t self, ServerLevel& level, BlockPos pos,
 }
 BlockStateId chorusConnections(BlockStateId s, ServerLevel& level, BlockPos pos) { return block_behaviour::chorusConnections(s, level, pos); }
 BlockStateId leavesDistance(BlockStateId s, ServerLevel& level, BlockPos pos) { return block_behaviour::leavesDistance(s, level, pos); }
+void playNote(ServerLevel& level, BlockPos pos, BlockStateId s) { block_behaviour::playNote(level, pos, s); }
+BlockStateId railUpdateDir(ServerLevel& level, BlockPos pos, BlockStateId s, bool hasSignal, bool first) {
+    RailState rail(level, pos, s);
+    rail.place(hasSignal, first, bs::getValue(s, "shape").value_or("north_south"));
+    return rail.state;
+}
+int railPotentialConnections(ServerLevel& level, BlockPos pos, BlockStateId s) { return RailState(level, pos, s).countPotentialConnections(); }
+bool railShouldBeRemoved(ServerLevel& level, BlockPos pos, BlockStateId s) { // BaseRailBlock.shouldBeRemoved
+    auto rigid = [&](BlockPos p) { return (bs::flags(level.getBlockState(p)) & bs::kRigidSupportUp) != 0; };
+    if (!rigid(pos.below())) return true;
+    auto shape = bs::getValue(s, "shape").value_or("");
+    if (shape == "ascending_east") return !rigid(pos.east());
+    if (shape == "ascending_west") return !rigid(pos.west());
+    if (shape == "ascending_north") return !rigid(pos.north());
+    if (shape == "ascending_south") return !rigid(pos.south());
+    return false;
+}
+void ringBell(ServerLevel& level, BlockPos pos, std::optional<Direction> direction) { // BellBlock.attemptToRing
+    BlockStateId s = level.getBlockState(pos);
+    LevelChunk* chunk = level.getChunkIfLoaded({pos.x >> 4, pos.z >> 4});
+    auto* be = chunk ? chunk->blockEntityAt(pos.x, pos.y, pos.z) : nullptr;
+    if (!be || be->blockAtLoad != bs::blockOf(s)) return;
+    Direction d = direction.value_or(dirValue(s, "facing"));
+    level.blockEvent(pos, bs::blockOf(s), 1, static_cast<int>(d)); // BellBlockEntity.onHit
+    static const int32_t kBell = registries::id("minecraft:sound_event", "minecraft:block.bell.use").value_or(-1);
+    level.playBlockSound(-1, pos, kBell, 2.0f, 1.0f);
+}
 } // namespace detail
 
 } // namespace block_behaviour

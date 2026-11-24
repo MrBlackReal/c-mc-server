@@ -7,7 +7,9 @@
 #include "server/level/server_level.hpp"
 #include "server/level/server_player.hpp"
 #include "world/item/crafting/recipes.hpp"
+#include "world/item/item_logic.hpp"
 #include "world/item/item_nbt.hpp"
+#include "world/inventory/menus.hpp"
 
 namespace mc {
 
@@ -35,6 +37,64 @@ int BlockEntityContainer::sizeFor(std::string_view type) {
     if (type == "minecraft:hopper" || type == "minecraft:brewing_stand") return 5;
     if (type == "minecraft:furnace" || type == "minecraft:smoker" || type == "minecraft:blast_furnace") return 3;
     return 0;
+}
+
+bool BlockEntityContainer::canPlaceItem(int slot, const ItemStack& stack) {
+    if (isFurnace(type)) { // AbstractFurnaceBlockEntity.canPlaceItem
+        if (slot == 2) return false;
+        if (slot != 1) return true;
+        static const int32_t kBucket = items::byName("minecraft:bucket").value_or(-1);
+        return isFurnaceFuel(stack) || (stack.item == kBucket && items_[1].item != kBucket);
+    }
+    if (type == "minecraft:brewing_stand") { // BrewingStandBlockEntity.canPlaceItem
+        if (slot == 4) return isBrewingFuel(stack);
+        if (slot == 3) return isBrewingReagent(stack);
+        return isPotionInput(stack) && items_[slot].isEmpty();
+    }
+    if (type == "minecraft:crafter") { // CrafterBlockEntity.canPlaceItem: fills the smallest stacks first
+        const nbt::Compound* be = tag();
+        auto disabled = [&](int i) {
+            if (const auto* arr = be ? be->getIntArray("disabled_slots") : nullptr)
+                for (int d : *arr)
+                    if (d == i) return true;
+            return false;
+        };
+        if (disabled(slot)) return false;
+        const ItemStack& current = items_[slot];
+        if (current.count >= current.maxStackSize() && !current.isEmpty()) return false;
+        if (current.isEmpty()) return true;
+        for (int i = slot + 1; i < 9; i++) // smallerStackExist
+            if (!disabled(i) && (items_[i].isEmpty() || (items_[i].count < current.count && ItemStack::isSameItemSameComponents(items_[i], current))))
+                return false;
+        return true;
+    }
+    return true;
+}
+
+bool BlockEntityContainer::isWorldly() const { return isFurnace(type) || type == "minecraft:brewing_stand" || type == "minecraft:shulker_box"; }
+
+std::vector<int> BlockEntityContainer::slotsForFace(Direction face) {
+    if (isFurnace(type)) return face == Direction::Down ? std::vector<int>{2, 1} : face == Direction::Up ? std::vector<int>{0} : std::vector<int>{1};
+    if (type == "minecraft:brewing_stand")
+        return face == Direction::Up ? std::vector<int>{3} : face == Direction::Down ? std::vector<int>{0, 1, 2, 3} : std::vector<int>{0, 1, 2, 4};
+    return Container::slotsForFace(face);
+}
+
+bool BlockEntityContainer::canPlaceItemThroughFace(int slot, const ItemStack& stack, std::optional<Direction> face) {
+    if (type == "minecraft:shulker_box") { // not a shulker box inside a shulker box
+        return stack.isEmpty() || stack.info().block < 0 || !blocks::isInstance(static_cast<uint32_t>(stack.info().block), "ShulkerBoxBlock");
+    }
+    (void)face;
+    return canPlaceItem(slot, stack);
+}
+
+bool BlockEntityContainer::canTakeItemThroughFace(int slot, const ItemStack& stack, Direction face) {
+    if (isFurnace(type)) return face == Direction::Down && slot == 1 ? items::hasTag(stack.item, "minecraft:furnace_fuel_bottom_takeable") : true;
+    if (type == "minecraft:brewing_stand") {
+        static const int32_t kBottle = items::byName("minecraft:glass_bottle").value_or(-1);
+        return slot == 3 ? stack.item == kBottle : true;
+    }
+    return true;
 }
 
 nbt::Compound* BlockEntityContainer::tag() {
@@ -78,6 +138,7 @@ void BlockEntityContainer::setChanged() {
     if (list.items.empty() && type == "minecraft:shulker_box") be->tag.remove("Items");
     else be->tag.put("Items", std::move(list));
     chunk.dirty = true;
+    level_.blockEntitySetChanged(pos); // (BlockEntity.setChanged: comparators re-measure)
 }
 
 bool BlockEntityContainer::stillValid(ServerPlayer& player) {
@@ -125,6 +186,10 @@ void BlockEntityContainer::openerCountChanged(bool opened) {
             }
         }
         level_.blockEvent(pos, block, 1, openers);
+        if (type == "minecraft:trapped_chest") { // TrappedChestBlockEntity.signalOpenCount: its power changed
+            level_.updateNeighborsAt(pos, block);
+            level_.updateNeighborsAt(pos.below(), block);
+        }
     } else if (type == "minecraft:ender_chest") {
         if (first) sound("minecraft:block.ender_chest.open", pos.x + 0.5, pos.y + 0.5, pos.z + 0.5);
         if (last) sound("minecraft:block.ender_chest.close", pos.x + 0.5, pos.y + 0.5, pos.z + 0.5);

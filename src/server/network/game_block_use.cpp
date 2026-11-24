@@ -289,6 +289,8 @@ UseResult ServerGamePacketListener::useItemOnBlock(ItemStack& stack, int hand, B
         static const int32_t kInsert = soundId("minecraft:block.decorated_pot.insert");
         level.playBlockSound(-1, pos, kInsert, 1.0f, 0.7f + 0.5f * pitchBend);
         level.sendParticles("minecraft:dust_plume", pos.x + 0.5, pos.y + 1.2, pos.z + 0.5, 7, 0, 0, 0, 0);
+        level.blockEntitySetChanged(pos);
+        level.updateNeighbourForOutputSignal(pos, block);
         return UseResult::Success;
     }
 
@@ -323,7 +325,9 @@ UseResult ServerGamePacketListener::useItemOnBlock(ItemStack& stack, int hand, B
                 consume();
                 lectern->put("Book", item_nbt::write(one));
                 lectern->put("Page", 0);
+                level.blockEntitySetChanged(pos);
                 level.setBlock(pos, bs::setBool(bs::setBool(state, "powered", false), "has_book", true)); // resetBookState
+                level.updateNeighborsAt(pos.below(), block);
                 static const int32_t kPut = soundId("minecraft:item.book.put");
                 level.playBlockSound(-1, pos, kPut, 1.0f, 1.0f);
             }

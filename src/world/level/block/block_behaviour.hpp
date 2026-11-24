@@ -50,7 +50,9 @@ BlockStateId withPropertiesOf(uint32_t block, BlockStateId from);
 // Block.updateFromNeighbourShapes: `state` at `pos` after updateShape towards every neighbour.
 BlockStateId updateFromNeighbourShapes(BlockStateId state, ServerLevel& level, BlockPos pos);
 // BlockBehaviour.onPlace, after any block change (`old` is what was there before).
-void onPlace(ServerLevel& level, BlockPos pos, BlockStateId state, BlockStateId old);
+void onPlace(ServerLevel& level, BlockPos pos, BlockStateId state, BlockStateId old, bool movedByPiston = false);
+// BlockBehaviour.affectNeighborsAfterRemoval: `state` at `pos` was replaced by another block.
+void affectNeighborsAfterRemoval(ServerLevel& level, BlockPos pos, BlockStateId state, bool movedByPiston);
 // Fallable.onLand / onBrokenAfterFall: a falling block became a block again (concrete powder
 // in water hardens, anvils clang), or broke.
 void onLand(ServerLevel& level, BlockPos pos, BlockStateId state, BlockStateId replaced);
@@ -62,7 +64,7 @@ bool fireCanBePlacedAt(ServerLevel& level, BlockPos pos);
 BlockStateId updateShape(BlockStateId state, ServerLevel& level, BlockPos pos, Direction toNeighbour, BlockPos neighbourPos,
                          BlockStateId neighbourState);
 // BlockBehaviour.neighborChanged: a neighbour of `pos` changed (`sourceBlock` is what it was).
-void neighborChanged(ServerLevel& level, BlockPos pos, BlockStateId state, uint32_t sourceBlock);
+void neighborChanged(ServerLevel& level, BlockPos pos, BlockStateId state, uint32_t sourceBlock, bool movedByPiston = false);
 bool isRedstoneWire(BlockStateId state);
 // BlockBehaviour.updateIndirectNeighbourShapes (redstone wire: wires one step up or down).
 void updateIndirectNeighbourShapes(ServerLevel& level, BlockPos pos, BlockStateId state, int flags, int depth);

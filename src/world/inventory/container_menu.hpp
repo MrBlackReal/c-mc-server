@@ -6,6 +6,7 @@
 #include <set>
 #include <vector>
 
+#include "core/direction.hpp"
 #include "world/item/item_stack.hpp"
 
 namespace mc {
@@ -31,6 +32,24 @@ public:
         item(slot) = std::move(stack);
         setChanged();
     }
+    bool isEmpty() {
+        for (int i = 0; i < size(); i++)
+            if (!item(i).isEmpty()) return false;
+        return true;
+    }
+    // Container.canPlaceItem / canTakeItem: what hoppers and droppers may put in or take out.
+    virtual bool canPlaceItem(int /*slot*/, const ItemStack& /*stack*/) { return true; }
+    virtual bool canTakeItem(Container& /*into*/, int /*slot*/, const ItemStack& /*stack*/) { return true; }
+    // WorldlyContainer (furnaces, brewing stands, shulker boxes, composters): which slots each side
+    // reaches, and what may go in or out through it.
+    virtual bool isWorldly() const { return false; }
+    virtual std::vector<int> slotsForFace(Direction /*face*/) {
+        std::vector<int> all(size());
+        for (int i = 0; i < size(); i++) all[i] = i;
+        return all;
+    }
+    virtual bool canPlaceItemThroughFace(int /*slot*/, const ItemStack& /*stack*/, std::optional<Direction> /*face*/) { return true; }
+    virtual bool canTakeItemThroughFace(int /*slot*/, const ItemStack& /*stack*/, Direction /*face*/) { return true; }
 };
 
 // SimpleContainer: its own list of slots.

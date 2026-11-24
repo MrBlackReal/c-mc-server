@@ -9,6 +9,7 @@
 #include "world/item/item_nbt.hpp"
 #include "world/level/block/entity/block_entity_container.hpp"
 #include "world/level/block/entity/block_entity_ticker.hpp"
+#include "world/level/block/redstone_blocks.hpp"
 
 namespace mc {
 
@@ -448,7 +449,7 @@ public:
         return book;
     }
     void setItem(int, ItemStack) override {}
-    void setChanged() override { level_.blockEntityChanged(pos_); }
+    void setChanged() override { level_.blockEntitySetChanged(pos_); }
     bool stillValid(ServerPlayer& player) override { // stillValidBlockEntity && hasBook
         const ItemStack& book = item(0);
         return be() && player.isWithinBlockInteractionRange(pos_, 4.0) &&
@@ -481,7 +482,10 @@ private:
             tag->remove("Page");
         }
         BlockStateId state = level_.getBlockState(pos_); // LecternBlock.resetBookState
-        if (blocks::hasProperty(state, "has_book")) level_.setBlock(pos_, blocks::setBool(blocks::setBool(state, "powered", false), "has_book", false));
+        if (blocks::hasProperty(state, "has_book")) {
+            level_.setBlock(pos_, blocks::setBool(blocks::setBool(state, "powered", false), "has_book", false));
+            level_.updateNeighborsAt(pos_.below(), blocks::blockOf(state));
+        }
     }
     ServerLevel& level_;
     BlockPos pos_;
@@ -506,12 +510,10 @@ void LecternMenu::setPage(int page) { // LecternBlockEntity.setPage, then broadc
     nbt::Compound* tag = c->be();
     if (tag && newPage != tag->getInt("Page")) {
         tag->put("Page", newPage);
-        level_.blockEntityChanged(pos_);
+        level_.blockEntitySetChanged(pos_);
         // LecternBlock.signalPageChange: a redstone pulse
         BlockStateId state = level_.getBlockState(pos_);
-        if (blocks::hasProperty(state, "powered")) level_.setBlock(pos_, blocks::setBool(state, "powered", true));
-        level_.scheduleTick(pos_, blocks::blockOf(state), 2);
-        level_.levelEvent(1043, pos_, 0);
+        if (blocks::hasProperty(state, "powered")) block_behaviour::redstone_blocks::lecternSignalPageChange(level_, pos_, state);
     }
     broadcastChanges();
 }
@@ -610,7 +612,7 @@ bool BeaconMenu::updateEffects(std::optional<int> primary, std::optional<int> se
         };
         put("primary_effect", primary);
         put("secondary_effect", secondary);
-        player_.level().blockEntityChanged(pos_);
+        player_.level().blockEntitySetChanged(pos_);
     }
     slot(0).remove(1);
     return true;

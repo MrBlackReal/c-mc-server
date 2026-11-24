@@ -14,6 +14,7 @@
 #include "world/entity/experience_orb.hpp"
 #include "world/item/crafting/recipes.hpp"
 #include "world/level/block/entity/block_entity_components.hpp"
+#include "world/level/block/redstone_blocks.hpp"
 
 namespace mc {
 
@@ -636,7 +637,7 @@ void PlayerList::tick() {
             if (dx * dx + dy * dy + dz * dz < 64.0 * 64.0) pl->connection().send(p);
         }
     }
-    for (const auto& ev : server_.overworld().runBlockEvents()) {
+    for (const auto& ev : server_.overworld().takeBlockEvents()) {
         Packet p(pk::BLOCK_EVENT);
         p.writeBlockPos(ev.pos.x, ev.pos.y, ev.pos.z);
         p.writeByte(static_cast<uint8_t>(ev.b0));
@@ -713,6 +714,21 @@ void PlayerList::tick() {
         p->tickExperience();
         p->tickEffects();
         p->syncAttributes(false);
+    }
+    for (auto& p : players_) {
+        // LivingEntity.aiStep -> applyEffectsFromBlocks: blocks the player is in react (pressure
+        // plates). (Simplified to the blocks around where the player is now.)
+        if (p->gameMode == GameType::Spectator || p->disconnected) continue;
+        AABB box = p->boundingBox().inflate(-1.0e-5, -1.0e-5, -1.0e-5);
+        ServerLevel& level = p->level();
+        for (int bx = static_cast<int>(std::floor(box.minX)); bx <= static_cast<int>(std::floor(box.maxX)); bx++)
+            for (int by = std::max(level.minY(), static_cast<int>(std::floor(box.minY))); by <= std::min(level.maxY(), static_cast<int>(std::floor(box.maxY))); by++)
+                for (int bz = static_cast<int>(std::floor(box.minZ)); bz <= static_cast<int>(std::floor(box.maxZ)); bz++) {
+                    BlockPos bp{bx, by, bz};
+                    if (!level.getChunkIfLoaded({bx >> 4, bz >> 4})) continue;
+                    BlockStateId st = level.getBlockState(bp);
+                    if (!blocks::isAir(st)) block_behaviour::redstone_blocks::entityInside(level, bp, st, box);
+                }
     }
     for (auto& p : players_) touchItems(*p);
     trackEntities();

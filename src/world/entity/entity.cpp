@@ -8,6 +8,9 @@
 #include "core/registries.hpp"
 #include "world/level/block/block_behaviour.hpp"
 #include "world/level/material/fluids.hpp"
+#include "world/level/block/redstone_blocks.hpp"
+#include "world/level/block/entity/hopper.hpp"
+#include "world/entity/item_entity.hpp"
 
 namespace mc {
 
@@ -289,6 +292,11 @@ void Entity::applyEffectsFromBlocks(ServerLevel& level, double fx, double fy, do
                 if (blocks::isAir(state)) continue;
                 uint32_t b = blocks::blockOf(state);
                 AABB blockBox{static_cast<double>(bx), static_cast<double>(by), static_cast<double>(bz), bx + 1.0, by + 1.0, bz + 1.0};
+                if (blockBox.intersects(swept)) {
+                    block_behaviour::redstone_blocks::entityInside(level, p, state, swept); // (pressure plates, tripwire)
+                    if (b == gen::block::HOPPER)
+                        if (auto* item = dynamic_cast<ItemEntity*>(this)) hopper::entityInside(level, p, state, *item);
+                }
                 if (blocks::isInstance(b, "BaseFireBlock") && blockBox.intersects(swept)) { // BaseFireBlock.entityInside
                     fireIgnite = true;
                     fireHurts.push_back(b == gen::block::SOUL_FIRE ? 2.0f : 1.0f);

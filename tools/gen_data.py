@@ -223,6 +223,12 @@ def gen_behaviour():
            "    int32_t weathersTo;       // WeatheringCopper.getNext, -1 if none",
            "    std::string_view treeGrower; // SaplingBlock's TreeGrower name, empty if none",
            "    std::string_view growsInto;  // MushroomBlock's huge mushroom feature, empty if none",
+           "    int16_t redstoneParam;       // ButtonBlock.ticksToStayPressed, PressurePlateBlock's sensitivity (0 everything,",
+           "                                 // 1 mobs), WeightedPressurePlateBlock.maxWeight; else 0",
+           "    bool arrowsPress;            // BlockSetType.canButtonBeActivatedByArrows (buttons)",
+           "    bool openByHand;             // BlockSetType.canOpenByHand (doors, trapdoors)",
+           "    int8_t pushReaction;         // BlockState.getPistonPushReaction (PushReaction ordinal: 0 push_pull, 1 push,",
+           "                                 // 2 popped, 3 immoveable, 4 ignore_entity)",
            "};",
            "struct InstrumentInfo { std::string_view name; int32_t sound; bool tunable, worksAboveNoteBlock, customSound; };",
            "extern const std::span<const InstrumentInfo> kInstruments; // NoteBlockInstrument, in enum order",
@@ -318,7 +324,8 @@ def gen_behaviour():
                                  f"{block_ids.get(b.get('potted'), -1)}, {block_ids.get(b.get('candle_cake'), -1)}, "
                                  f"{b.get('ignite_odds', 0)}, {b.get('burn_odds', 0)}, {cstr(b.get('xp_range', ''))}, "
                                  f"{'true' if b.get('ignited_by_lava') else 'false'}, {b.get('weather_age', -1)}, "
-                                 f"{block_ids.get(b.get('weathers_to'), -1)}, {cstr(b.get('tree_grower', ''))}, {cstr(b.get('grows_into', ''))}}},")
+                                 f"{block_ids.get(b.get('weathers_to'), -1)}, {cstr(b.get('tree_grower', ''))}, {cstr(b.get('grows_into', ''))}, "
+                                 f"{b.get('redstone_param', 0)}, {str(b.get('arrows_press', False)).lower()}, {str(b.get('open_by_hand', True)).lower()}, {b.get('push_reaction', 0)}}},")
     assert all(rows), "missing block behaviour"
     cpp += ["constexpr BlockBehaviourInfo blocks[] = {"] + rows + ["};"]
     for i, shape in enumerate(ex["shapes"]):

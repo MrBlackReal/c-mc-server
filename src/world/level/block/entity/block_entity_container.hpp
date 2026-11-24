@@ -44,6 +44,13 @@ public:
     // The number of item slots a block entity type keeps, 0 if it isn't a container.
     static int sizeFor(std::string_view type);
 
+    // The rules of the block entity's own Container / WorldlyContainer implementation.
+    bool canPlaceItem(int slot, const ItemStack& stack) override;
+    bool isWorldly() const override;
+    std::vector<int> slotsForFace(Direction face) override;
+    bool canPlaceItemThroughFace(int slot, const ItemStack& stack, std::optional<Direction> face) override;
+    bool canTakeItemThroughFace(int slot, const ItemStack& stack, Direction face) override;
+
 private:
     void openerCountChanged(bool opened);
     ServerLevel& level_;
@@ -82,6 +89,9 @@ public:
     void setItem(int slot, ItemStack stack) override {
         if (slot < first_->size()) first_->setItem(slot, std::move(stack));
         else second_->setItem(slot - first_->size(), std::move(stack));
+    }
+    bool canPlaceItem(int slot, const ItemStack& stack) override {
+        return slot < first_->size() ? first_->canPlaceItem(slot, stack) : second_->canPlaceItem(slot - first_->size(), stack);
     }
     bool stillValid(ServerPlayer& player) override { return first_->stillValid(player) && second_->stillValid(player); }
     void startOpen(ServerPlayer& player) override {

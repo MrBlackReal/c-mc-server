@@ -73,7 +73,7 @@ BlockStateId LevelChunk::setBlockState(int x, int y, int z, BlockStateId state) 
         if (blocks::blockOf(old) != block) {
             int wx = pos_.x * 16 + x, wz = pos_.z * 16 + z;
             std::erase_if(blockEntities, [&](const BlockEntity& be) { return be.x == wx && be.y == y && be.z == wz; });
-            if (!blocks::behaviour(block).blockEntity.empty())
+            if (!blocks::behaviour(block).blockEntity.empty() && block != gen::block::MOVING_PISTON) // (newBlockEntity: null)
                 blockEntities.push_back({wx, y, wz, block, block_entity::createDefault(block, {wx, y, wz})});
         }
         for (auto& map : heightmaps_) updateHeightmap(map, x, y, z, state);

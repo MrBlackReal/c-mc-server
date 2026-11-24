@@ -329,6 +329,32 @@ public class Extractor {
                 f.setAccessible(true);
                 b.addProperty("grows_into", ((net.minecraft.resources.ResourceKey<?>) f.get(block)).identifier().toString());
             }
+            b.addProperty("push_reaction", block.defaultBlockState().getPistonPushReaction().ordinal());
+            for (BlockState st : block.getStateDefinition().getPossibleStates())
+                if (st.getPistonPushReaction() != block.defaultBlockState().getPistonPushReaction())
+                    System.err.println("WARNING: " + block + " has a per-state piston push reaction");
+            // Redstone parameters: how long buttons stay pressed, what pressure plates feel.
+            if (block instanceof net.minecraft.world.level.block.ButtonBlock) {
+                Field f = net.minecraft.world.level.block.ButtonBlock.class.getDeclaredField("ticksToStayPressed");
+                f.setAccessible(true);
+                b.addProperty("redstone_param", f.getInt(block));
+            }
+            if (block instanceof net.minecraft.world.level.block.WeightedPressurePlateBlock) {
+                Field f = net.minecraft.world.level.block.WeightedPressurePlateBlock.class.getDeclaredField("maxWeight");
+                f.setAccessible(true);
+                b.addProperty("redstone_param", f.getInt(block));
+            }
+            for (Class<?> c = block.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+                for (Field f : c.getDeclaredFields()) {
+                    if (java.lang.reflect.Modifier.isStatic(f.getModifiers()) || f.getType() != net.minecraft.world.level.block.state.properties.BlockSetType.class) continue;
+                    f.setAccessible(true);
+                    var t = (net.minecraft.world.level.block.state.properties.BlockSetType) f.get(block);
+                    if (block instanceof net.minecraft.world.level.block.PressurePlateBlock)
+                        b.addProperty("redstone_param", t.pressurePlateSensitivity() == net.minecraft.world.level.block.state.properties.BlockSetType.PressurePlateSensitivity.MOBS ? 1 : 0);
+                    if (t.canButtonBeActivatedByArrows()) b.addProperty("arrows_press", true);
+                    if (!t.canOpenByHand()) b.addProperty("open_by_hand", false);
+                }
+            }
             if (block instanceof net.minecraft.world.level.block.FlowerPotBlock pot) // the plant in a potted block
                 b.addProperty("potted", BuiltInRegistries.BLOCK.getKey(pot.getPotted()).toString());
             if (block instanceof net.minecraft.world.level.block.CandleBlock candle) // CandleCakeBlock.byCandle

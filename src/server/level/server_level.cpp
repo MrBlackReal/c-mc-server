@@ -1,4 +1,7 @@
 #include "server/level/server_level.hpp"
+#include "world/level/redstone/redstone.hpp"
+#include "world/level/block/piston.hpp"
+#include "world/level/block/entity/hopper.hpp"
 
 #include <openssl/sha.h>
 
@@ -60,15 +63,99 @@ void ServerLevel::playDirectSound(double x, double y, double z, std::string soun
     sounds_.push_back({-1, std::move(sound), source, x, y, z, volume, pitch, seed, -1});
 }
 
-std::vector<ServerLevel::BlockEvent> ServerLevel::runBlockEvents() {
-    std::vector<BlockEvent> out;
-    // Events queued while running (none of ours do) wait for the next tick.
-    for (const auto& ev : std::exchange(blockEvents_, {})) {
+void ServerLevel::blockEvent(BlockPos pos, uint32_t block, int b0, int b1) {
+    for (const auto& ev : blockEvents_)
+        if (ev.pos == pos && ev.block == block && ev.b0 == b0 && ev.b1 == b1) return;
+    blockEvents_.push_back({pos, block, b0, b1});
+}
+
+void ServerLevel::runBlockEvents() {
+    std::vector<BlockEvent> reschedule;
+    while (!blockEvents_.empty()) {
+        BlockEvent ev = blockEvents_.front();
+        blockEvents_.erase(blockEvents_.begin());
+        if (!inBlockTickingRange({ev.pos.x >> 4, ev.pos.z >> 4})) { // shouldTickBlocksAt
+            reschedule.push_back(ev);
+            continue;
+        }
         BlockStateId state = getBlockState(ev.pos);
         if (blocks::blockOf(state) != ev.block) continue; // ServerLevel.doBlockEvent
-        if (block_behaviour::triggerEvent(*this, ev.pos, state, ev.b0, ev.b1)) out.push_back(ev);
+        if (block_behaviour::triggerEvent(*this, ev.pos, state, ev.b0, ev.b1)) sentBlockEvents_.push_back(ev);
     }
-    return out;
+    for (const auto& ev : reschedule) blockEvent(ev.pos, ev.block, ev.b0, ev.b1);
+}
+
+ServerLevel::MovingPiston* ServerLevel::movingPiston(BlockPos pos) {
+    auto it = movingPistons_.find(pos.asLong());
+    return it == movingPistons_.end() ? nullptr : &it->second;
+}
+
+void ServerLevel::setMovingPiston(BlockPos pos, MovingPiston piston) {
+    if (pos.y < minY() || pos.y > maxY()) return;
+    LevelChunk& chunk = getChunk({pos.x >> 4, pos.z >> 4});
+    uint32_t block = blocks::blockOf(getBlockState(pos));
+    if (block != gen::block::MOVING_PISTON) return; // LevelChunk.setBlockEntity: not a block entity block
+    std::erase_if(chunk.blockEntities, [&](const LevelChunk::BlockEntity& be) { return be.x == pos.x && be.y == pos.y && be.z == pos.z; });
+    chunk.blockEntities.push_back({pos.x, pos.y, pos.z, block, nbt::Compound{}});
+    movingPistons_[pos.asLong()] = piston;
+    saveMovingPiston(pos);
+    addBlockEntityTicker(pos);
+}
+
+void ServerLevel::addBlockEntityTicker(BlockPos pos) {
+    // LevelChunk.updateBlockEntityTicker: rebinds the ticker already at `pos`, else adds one
+    // (Level.addBlockEntityTicker: to the pending list while block entities are ticking).
+    if (tickerAt_.contains(pos.asLong())) return;
+    uint64_t id = nextTickerId_++;
+    tickerAt_[pos.asLong()] = id;
+    (tickingBlockEntities_ ? pendingTickers_ : tickers_).push_back({pos, id});
+}
+
+void ServerLevel::removeBlockEntity(BlockPos pos) {
+    if (LevelChunk* chunk = getChunkIfLoaded({pos.x >> 4, pos.z >> 4})) {
+        std::erase_if(chunk->blockEntities, [&](const LevelChunk::BlockEntity& be) { return be.x == pos.x && be.y == pos.y && be.z == pos.z; });
+        chunk->dirty = true;
+    }
+    movingPistons_.erase(pos.asLong());
+    tickerAt_.erase(pos.asLong());
+}
+
+void ServerLevel::saveMovingPiston(BlockPos pos) { // PistonMovingBlockEntity.saveAdditional
+    MovingPiston* p = movingPiston(pos);
+    LevelChunk* chunk = getChunkIfLoaded({pos.x >> 4, pos.z >> 4});
+    auto* be = chunk ? chunk->blockEntityAt(pos.x, pos.y, pos.z) : nullptr;
+    if (!p || !be) return;
+    nbt::Compound tag;
+    tag.put("id", "minecraft:piston");
+    tag.put("x", pos.x);
+    tag.put("y", pos.y);
+    tag.put("z", pos.z);
+    tag.put("blockState", chunk_serializer::writeBlockState(p->movedState));
+    tag.put("facing", static_cast<int32_t>(p->direction));
+    tag.put("progress", p->progressO);
+    tag.put("extending", nbt::byteTag(p->extending));
+    tag.put("source", nbt::byteTag(p->source));
+    be->tag = std::move(tag);
+    chunk->dirty = true;
+}
+
+void ServerLevel::loadMovingPistons(LevelChunk& chunk) { // registerAllBlockEntitiesAfterLevelLoad
+    for (const auto& be : chunk.blockEntities) {
+        if (be.tag.getString("id") != "minecraft:piston") {
+            if (block_entity::hasTicker(be.tag.getString("id"))) addBlockEntityTicker({be.x, be.y, be.z});
+            continue;
+        }
+        BlockPos pos{be.x, be.y, be.z};
+        MovingPiston p;
+        if (const nbt::Tag* st = be.tag.get("blockState"))
+            if (auto state = chunk_serializer::readBlockState(*st)) p.movedState = *state;
+        p.direction = static_cast<Direction>(std::clamp(be.tag.getInt("facing"), 0, 5));
+        p.progress = p.progressO = static_cast<float>(be.tag.getDouble("progress"));
+        p.extending = be.tag.getBool("extending");
+        p.source = be.tag.getBool("source");
+        movingPistons_[pos.asLong()] = p;
+        addBlockEntityTicker(pos);
+    }
 }
 
 uint32_t ServerLevel::getNoiseBiome(int qx, int qy, int qz) {
@@ -223,6 +310,7 @@ LevelChunk& ServerLevel::getChunk(ChunkPos pos) {
     LevelChunk& chunk = *slot;
     loadEntities(chunk);
     unpackBlockTicks(chunk);
+    loadMovingPistons(chunk);
     initializeLight(chunk);
     return chunk;
 }
@@ -363,18 +451,36 @@ void ServerLevel::scheduleTick(BlockPos pos, uint32_t block, int delay, int prio
 }
 
 void ServerLevel::tickBlockEntities() {
-    for (auto& [_, chunk] : chunks_) {
-        if (!inBlockTickingRange(chunk->pos())) continue; // Level.shouldTickBlocksAt
-        for (size_t i = 0; i < chunk->blockEntities.size(); i++) { // (a ticker may add block entities)
-            auto& be = chunk->blockEntities[i];
-            if (!block_entity::hasTicker(be.tag.getString("id"))) continue;
-            BlockPos pos{be.x, be.y, be.z};
-            BlockStateId state = chunk->getBlockState(be.x & 15, be.y, be.z & 15);
-            if (blocks::blockOf(state) != be.blockAtLoad) continue;
-            // (tickers must not add block entities to this chunk: `be` would move)
-            if (block_entity::tick(*this, pos, state, be.tag)) chunk->dirty = true;
+    // Level.tickBlockEntities: the tickers in the order they were added (new ones wait for the next tick).
+    tickingBlockEntities_ = true;
+    tickers_.insert(tickers_.end(), pendingTickers_.begin(), pendingTickers_.end());
+    pendingTickers_.clear();
+    for (size_t i = 0; i < tickers_.size(); i++) {
+        auto [pos, id] = tickers_[i];
+        auto it = tickerAt_.find(pos.asLong());
+        if (it == tickerAt_.end() || it->second != id) continue; // (removed; dropped below)
+        if (!inBlockTickingRange({pos.x >> 4, pos.z >> 4})) continue; // LevelChunk.isTicking
+        BlockStateId state = getBlockState(pos);
+        if (blocks::is(state, gen::block::MOVING_PISTON)) {
+            if (movingPiston(pos)) block_behaviour::piston::tickMoving(*this, pos);
+            continue;
+        }
+        LevelChunk* chunk = getChunkIfLoaded({pos.x >> 4, pos.z >> 4});
+        auto* be = chunk ? chunk->blockEntityAt(pos.x, pos.y, pos.z) : nullptr;
+        if (!be || be->blockAtLoad != blocks::blockOf(state)) continue; // BlockEntityType.isValid
+        std::string type = be->tag.getString("id");
+        if (type == "minecraft:hopper") {
+            hopper::pushItemsTick(*this, pos, state);
+        } else if (block_entity::tick(*this, pos, state, be->tag)) {
+            chunk->dirty = true;
+            if (BlockEntityContainer::isFurnace(type) || type == "minecraft:brewing_stand") blockEntitySetChanged(pos); // setChanged
         }
     }
+    std::erase_if(tickers_, [&](const auto& t) {
+        auto it = tickerAt_.find(t.first.asLong());
+        return it == tickerAt_.end() || it->second != t.second;
+    });
+    tickingBlockEntities_ = false;
 }
 
 bool ServerLevel::hasScheduledFluidTick(BlockPos pos, uint8_t fluid) {
@@ -413,7 +519,25 @@ void ServerLevel::runTicks(std::vector<LevelChunk::ScheduledTick> LevelChunk::*m
         for (auto it = due.begin() + 65536; it != due.end(); ++it) (getChunk({it->pos.x >> 4, it->pos.z >> 4}).*member).push_back(*it);
         due.resize(65536);
     }
+    if (member == &LevelChunk::blockTicks) { // (willTickThisTick asks about the rest of this list)
+        runningTicks_ = std::move(due);
+        runningBlockTicks_ = true;
+        for (runningTickIndex_ = 0; runningTickIndex_ < runningTicks_.size();) {
+            LevelChunk::ScheduledTick t = runningTicks_[runningTickIndex_++];
+            run(t);
+        }
+        runningBlockTicks_ = false;
+        runningTicks_.clear();
+        return;
+    }
     for (const auto& t : due) run(t);
+}
+
+bool ServerLevel::willTickThisTick(BlockPos pos, uint32_t block) {
+    if (!runningBlockTicks_) return false;
+    for (size_t i = runningTickIndex_; i < runningTicks_.size(); i++)
+        if (runningTicks_[i].pos == pos && runningTicks_[i].block == block) return true;
+    return false;
 }
 
 void ServerLevel::tickBlocks() {
@@ -779,11 +903,24 @@ bool ServerLevel::setBlockAt(BlockPos pos, BlockStateId state, int flags, int de
         }
         preRemoveSideEffects(pos, old, std::move(*removedBlockEntity));
     }
-    // TODO: BlockBehaviour.affectNeighborsAfterRemoval (redstone components tell their neighbours).
-    if (!(flags & kSkipOnPlace)) block_behaviour::onPlace(*this, pos, state, old);
+    // BlockBehaviour.affectNeighborsAfterRemoval: redstone components tell their neighbours they're gone.
+    bool movedByPiston = flags & kMovedByPiston;
+    bool blockChanged = blocks::blockOf(old) != blocks::blockOf(state);
+    if (blockChanged) { // LevelChunk.removeBlockEntity (and its ticker), then the new block's ticker
+        movingPistons_.erase(pos.asLong());
+        tickerAt_.erase(pos.asLong());
+        if (auto* be = chunk.blockEntityAt(pos.x, pos.y, pos.z); be && block_entity::hasTicker(be->tag.getString("id"))) addBlockEntityTicker(pos);
+    }
+    if ((blockChanged || blocks::isInstance(blocks::blockOf(state), "BaseRailBlock")) && ((flags & kUpdateNeighbors) || movedByPiston))
+        block_behaviour::affectNeighborsAfterRemoval(*this, pos, old, movedByPiston);
+    if (blocks::blockOf(getBlockState(pos)) != blocks::blockOf(state)) return false; // (LevelChunk.setBlockState: replaced meanwhile)
+    if (!(flags & kSkipOnPlace)) block_behaviour::onPlace(*this, pos, state, old, movedByPiston);
     if (getBlockState(pos) != state) return true; // (onPlace replaced it; Level.setBlock stops there)
     if (flags & kUpdateClients) markChanged(pos);
-    if (flags & kUpdateNeighbors) updateNeighborsAt(pos, blocks::blockOf(old)); // TODO: analog output (comparators)
+    if (flags & kUpdateNeighbors) {
+        updateNeighborsAt(pos, blocks::blockOf(old));
+        if (redstone::hasAnalogOutputSignal(state)) updateNeighbourForOutputSignal(pos, blocks::blockOf(state));
+    }
     if (!(flags & kUpdateKnownShape) && depth < 512) {
         // Level.setBlock: the old state's indirect neighbours, then the new state's direct and indirect
         // ones, with UPDATE_NEIGHBORS and UPDATE_SUPPRESS_DROPS dropped (flags & -34).
@@ -843,9 +980,38 @@ void ServerLevel::neighborChanged(BlockPos pos, uint32_t sourceBlock) {
 }
 
 void ServerLevel::updateNeighboursOnBlockSet(BlockPos pos, BlockStateId oldState) {
-    (void)oldState; // TODO: oldState.affectNeighborsAfterRemoval when the block changed (redstone)
     BlockStateId state = getBlockState(pos);
-    updateNeighborsAt(pos, blocks::blockOf(state)); // TODO: analog output (comparators)
+    if (blocks::blockOf(oldState) != blocks::blockOf(state)) block_behaviour::affectNeighborsAfterRemoval(*this, pos, oldState, false);
+    updateNeighborsAt(pos, blocks::blockOf(state));
+    if (redstone::hasAnalogOutputSignal(state)) updateNeighbourForOutputSignal(pos, blocks::blockOf(state));
+}
+
+void ServerLevel::neighborChanged(BlockStateId state, BlockPos pos, uint32_t sourceBlock, bool movedByPiston) {
+    NeighborUpdate u{};
+    u.kind = NeighborUpdate::Kind::Full;
+    u.pos = pos, u.sourceBlock = sourceBlock, u.neighbourState = state, u.movedByPiston = movedByPiston;
+    addAndRun(pos, u);
+}
+
+void ServerLevel::updateNeighbourForOutputSignal(BlockPos pos, uint32_t changedBlock) {
+    for (Direction d : direction::kHorizontalPlane) {
+        BlockPos p = pos.relative(d);
+        if (!getChunkIfLoaded({p.x >> 4, p.z >> 4})) continue; // hasChunkAt
+        BlockStateId s = getBlockState(p);
+        if (blocks::is(s, gen::block::COMPARATOR)) {
+            neighborChanged(s, p, changedBlock, false);
+        } else if (blocks::flags(s) & blocks::kRedstoneConductor) {
+            p = p.relative(d);
+            s = getBlockState(p);
+            if (blocks::is(s, gen::block::COMPARATOR)) neighborChanged(s, p, changedBlock, false);
+        }
+    }
+}
+
+void ServerLevel::blockEntitySetChanged(BlockPos pos) {
+    blockEntityChanged(pos);
+    BlockStateId state = getBlockState(pos);
+    if (!blocks::isAir(state)) updateNeighbourForOutputSignal(pos, blocks::blockOf(state));
 }
 
 void ServerLevel::addAndRun(BlockPos pos, NeighborUpdate update) {
@@ -903,6 +1069,9 @@ bool ServerLevel::runNext(NeighborUpdate& u) {
     }
     case NeighborUpdate::Kind::Simple: // NeighborUpdater.executeUpdate
         if (u.pos.y >= minY() && u.pos.y <= maxY()) block_behaviour::neighborChanged(*this, u.pos, getBlockState(u.pos), u.sourceBlock);
+        return false;
+    case NeighborUpdate::Kind::Full:
+        if (u.pos.y >= minY() && u.pos.y <= maxY()) block_behaviour::neighborChanged(*this, u.pos, u.neighbourState, u.sourceBlock, u.movedByPiston);
         return false;
     case NeighborUpdate::Kind::Multi: { // MultiNeighborUpdate.runNext
         BlockPos p = u.pos.relative(kNeighbourUpdateOrder[u.idx++]);
@@ -1087,6 +1256,84 @@ void ServerClockManager::tick(bool advanceTime) {
 
 // The day timeline's gameplay/sky_light_level multiplier at `ticks` into the day (keyframes
 // interpolated linearly, wrapping around the period).
+float ServerClockManager::sunAngle(int64_t totalTicks) {
+    struct Track {
+        std::vector<std::pair<int, float>> keys;
+        float x1 = 0, y1 = 0, x2 = 1, y2 = 1;
+        bool bezier = false;
+    };
+    static const Track track = [] {
+        Track t;
+        json::Value all = json::parse(gen::kRegistryElementsJson);
+        const json::Value& sun = all["minecraft:timeline"]["minecraft:day"]["tracks"]["minecraft:visual/sun_angle"];
+        for (const auto& k : sun["keyframes"].array()) t.keys.emplace_back(static_cast<int>(k["ticks"].number()), static_cast<float>(k["value"].number()));
+        if (sun.has("ease") && sun["ease"].has("cubic_bezier")) {
+            const auto& c = sun["ease"]["cubic_bezier"].array();
+            t.x1 = static_cast<float>(c[0].number()), t.y1 = static_cast<float>(c[1].number());
+            t.x2 = static_cast<float>(c[2].number()), t.y2 = static_cast<float>(c[3].number());
+            t.bezier = true;
+        }
+        return t;
+    }();
+    if (track.keys.empty()) return 0.0f;
+    if (track.keys.size() == 1) return track.keys[0].second;
+    // EasingType.CubicBezier.apply
+    auto curve = [](float v1, float v2) { return std::array<float, 3>{3.0f * v1 - 3.0f * v2 + 1.0f, -6.0f * v1 + 3.0f * v2, 3.0f * v1}; };
+    auto sample = [](const std::array<float, 3>& c, float t) { return ((c[0] * t + c[1]) * t + c[2]) * t; };
+    auto gradient = [](const std::array<float, 3>& c, float t) { return (3.0f * c[0] * t + 2.0f * c[1]) * t + c[2]; };
+    auto ease = [&](float x) {
+        if (!track.bezier) return x;
+        auto xc = curve(track.x1, track.x2), yc = curve(track.y1, track.y2);
+        float t = x;
+        bool solved = false;
+        for (int i = 0; i < 4; i++) {
+            float error = sample(xc, t) - x;
+            if (std::abs(error) < 1.0e-5f) {
+                solved = true;
+                break;
+            }
+            float g = gradient(xc, t);
+            if (g < 1.0e-5f) break;
+            t -= std::clamp(error / g, -0.25f, 0.25f);
+        }
+        if (!solved) { // solveTBisect
+            float t0 = 0.0f, t1 = 1.0f;
+            for (; t0 < t1; t = (t1 + t0) / 2.0f) {
+                float error = sample(xc, t) - x;
+                if (std::abs(error) < 1.0e-5f) break;
+                if (error < 0.0f) t0 = t;
+                else t1 = t;
+            }
+        }
+        return sample(yc, t);
+    };
+    // KeyframeTrackSampler with a 24000 tick period: segments from the last keyframe (a period
+    // earlier) through each pair to the first keyframe (a period later).
+    constexpr int kPeriod = 24000;
+    struct Segment {
+        float from;
+        int fromTicks;
+        float to;
+        int toTicks;
+    };
+    std::vector<Segment> segments;
+    segments.push_back({track.keys.back().second, track.keys.back().first - kPeriod, track.keys.front().second, track.keys.front().first});
+    for (size_t i = 0; i + 1 < track.keys.size(); i++)
+        segments.push_back({track.keys[i].second, track.keys[i].first, track.keys[i + 1].second, track.keys[i + 1].first});
+    segments.push_back({track.keys.back().second, track.keys.back().first, track.keys.front().second, track.keys.front().first + kPeriod});
+    int64_t t = ((totalTicks % kPeriod) + kPeriod) % kPeriod;
+    const Segment* seg = &segments.back();
+    for (const auto& s : segments)
+        if (t < s.toTicks) {
+            seg = &s;
+            break;
+        }
+    if (t <= seg->fromTicks) return seg->from;
+    if (t >= seg->toTicks) return seg->to;
+    float alpha = static_cast<float>(t - seg->fromTicks) / static_cast<float>(seg->toTicks - seg->fromTicks);
+    return seg->from + ease(alpha) * (seg->to - seg->from);
+}
+
 float ServerClockManager::skyLightMultiplier(int64_t totalTicks) {
     static const std::vector<std::pair<int, float>> keys = [] {
         std::vector<std::pair<int, float>> out;

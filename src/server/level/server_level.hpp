@@ -194,12 +194,22 @@ public:
     // LevelAccessor.neighborShapeChanged: re-run `pos`'s updateShape for its neighbour towards
     // `toNeighbour` (whose state is taken now). Queued on the neighbour updater.
     void neighborShapeChanged(Direction toNeighbour, BlockPos pos, BlockPos neighbourPos, int flags, int depth);
+    // BlockState.updateNeighbourShapes: shape updates for the six neighbours of `pos` (holding `state`).
+    void updateNeighbourShapes(BlockPos pos, BlockStateId state, int flags, int depth);
     // Level.updateNeighborsAt: neighborChanged for the six neighbours of `pos` (NeighborUpdater.UPDATE_ORDER),
     // except the one towards `skip`. `sourceBlock` is the block that changed.
     void updateNeighborsAt(BlockPos pos, uint32_t sourceBlock) { updateNeighborsAtExceptFromFacing(pos, sourceBlock, std::nullopt); }
     void updateNeighborsAtExceptFromFacing(BlockPos pos, uint32_t sourceBlock, std::optional<Direction> skip);
     // Level.neighborChanged: BlockBehaviour.neighborChanged for the block at `pos`.
     void neighborChanged(BlockPos pos, uint32_t sourceBlock);
+    // Level.neighborChanged(state, pos, block, orientation, movedByPiston): the same for a given
+    // state (CollectingNeighborUpdater.FullNeighborUpdate).
+    void neighborChanged(BlockStateId state, BlockPos pos, uint32_t sourceBlock, bool movedByPiston);
+    // Level.updateNeighbourForOutputSignal: comparators next to `pos` (or behind a conductor next to
+    // it) hear that what they measure may have changed.
+    void updateNeighbourForOutputSignal(BlockPos pos, uint32_t changedBlock);
+    // BlockEntity.setChanged: the chunk needs saving, and comparators reading the block re-measure.
+    void blockEntitySetChanged(BlockPos pos);
     // Level.updateNeighboursOnBlockSet: what /fill and /setblock do after placing without neighbour
     // updates: the neighbours of the block now at `pos` are told.
     void updateNeighboursOnBlockSet(BlockPos pos, BlockStateId oldState);
@@ -269,14 +279,40 @@ public:
         uint32_t block;
         int b0, b1;
     };
-    void blockEvent(BlockPos pos, uint32_t block, int b0, int b1) { blockEvents_.push_back({pos, block, b0, b1}); }
-    // ServerLevel.runBlockEvents: the events that should reach clients.
-    std::vector<BlockEvent> runBlockEvents();
+    // (The queue is a linked hash set: an event already waiting isn't queued twice.)
+    void blockEvent(BlockPos pos, uint32_t block, int b0, int b1);
+    // ServerLevel.runBlockEvents, until the queue is empty (events may queue more); the ones that
+    // should reach clients are kept for takeBlockEvents. Events in chunks that don't tick wait.
+    void runBlockEvents();
+    std::vector<BlockEvent> takeBlockEvents() { return std::exchange(sentBlockEvents_, {}); }
+    // ServerLevel.isHandlingTick: scheduled ticks, random ticks and block events are running.
+    bool isHandlingTick() const { return handlingTick_; }
+    void setHandlingTick(bool v) { handlingTick_ = v; }
+
+    // PistonMovingBlockEntity: a block on its way somewhere (MOVING_PISTON), kept live here and
+    // mirrored into the chunk's block entity NBT for saving.
+    struct MovingPiston {
+        BlockStateId movedState = 0;
+        Direction direction = Direction::Down;
+        bool extending = false, source = false;
+        float progress = 0, progressO = 0;
+        int64_t lastTicked = 0;
+    };
+    MovingPiston* movingPiston(BlockPos pos);
+    // HopperBlockEntity.tickedGameTime (not saved), by position.
+    std::unordered_map<int64_t, int64_t> hopperTickedGameTime;
+    // Level.setBlockEntity with a new PistonMovingBlockEntity (its ticker keeps the place in the
+    // ticker list of one that was already at `pos`), and Level.removeBlockEntity.
+    void setMovingPiston(BlockPos pos, MovingPiston piston);
+    void removeBlockEntity(BlockPos pos);
+    void saveMovingPiston(BlockPos pos); // writes the live state into the chunk's NBT
 
     // Scheduled block ticks (LevelTicks): `block`'s tick() runs at `pos` after `delay` game ticks,
     // unless one is already pending for that block there. Lower priorities run first.
     void scheduleTick(BlockPos pos, uint32_t block, int delay, int priority = 0);
     bool hasScheduledTick(BlockPos pos, uint32_t block);
+    // LevelTicks.willTickThisTick: a tick for `block` at `pos` is due later in the tick being run.
+    bool willTickThisTick(BlockPos pos, uint32_t block);
     // ServerLevel.tick's blockTicks.tick: runs the ticks that are due, in trigger/priority/schedule order.
     void tickBlocks();
     // The same for fluids (Level.scheduleTick(pos, Fluid, delay), fluidTicks.tick -> tickFluid).
@@ -362,15 +398,15 @@ private:
     void loadEntities(LevelChunk& chunk);
     void saveEntities(LevelChunk& chunk);
     void unloadEntities(LevelChunk& chunk);
-    void updateNeighbourShapes(BlockPos pos, BlockStateId state, int flags, int depth);
     // CollectingNeighborUpdater: updates made while one runs wait in a stack and run depth first,
     // in the order they were added.
     struct NeighborUpdate {
-        enum class Kind : uint8_t { Shape, Simple, Multi } kind;
+        enum class Kind : uint8_t { Shape, Simple, Multi, Full } kind;
         BlockPos pos;          // Shape/Simple: the block updated; Multi: the source
         BlockPos neighbourPos; // Shape
         Direction direction;   // Shape: towards the neighbour
-        BlockStateId neighbourState; // Shape
+        BlockStateId neighbourState; // Shape; Full: the state told
+        bool movedByPiston;    // Full
         int flags, depth;      // Shape
         uint32_t sourceBlock;  // Simple/Multi
         int8_t idx, skip;      // Multi: next direction in UPDATE_ORDER, the one skipped (-1: none)
@@ -379,6 +415,10 @@ private:
     void runNeighborUpdates();
     bool runNext(NeighborUpdate& update); // false when the update is done
     std::vector<NeighborUpdate> updateStack_, addedThisLayer_;
+    // The block ticks being run this tick (LevelTicks.toRunThisTick) and how far along they are.
+    std::vector<LevelChunk::ScheduledTick> runningTicks_;
+    size_t runningTickIndex_ = 0;
+    bool runningBlockTicks_ = false;
     int neighborUpdateCount_ = 0;
     bool setBlockAt(BlockPos pos, BlockStateId state, int flags, int depth);
     void markChanged(BlockPos pos);
@@ -414,7 +454,18 @@ private:
     std::vector<Sound> sounds_;
     std::vector<Particles> particles_;
     int64_t obfuscatedSeed_ = 0;
-    std::vector<BlockEvent> blockEvents_;
+    std::vector<BlockEvent> blockEvents_, sentBlockEvents_;
+    bool handlingTick_ = false;
+    // Level.blockEntityTickers: (position, wrapper id) in the order they were added; a wrapper is
+    // live while tickerAt_ maps its position to it (LevelChunk.tickersInLevel).
+    std::unordered_map<int64_t, MovingPiston> movingPistons_;
+    std::vector<std::pair<BlockPos, uint64_t>> tickers_, pendingTickers_;
+    std::unordered_map<int64_t, uint64_t> tickerAt_;
+    uint64_t nextTickerId_ = 1;
+    bool tickingBlockEntities_ = false;
+    void loadMovingPistons(LevelChunk& chunk);
+    // LevelChunk.updateBlockEntityTicker: a ticker for the block entity at `pos` (kept if one is there).
+    void addBlockEntityTicker(BlockPos pos);
     std::unordered_map<int64_t, int> signEditors_;
     std::unordered_map<int64_t, std::weak_ptr<BlockEntityContainer>> containers_;
     int64_t gameTime_ = 0;
@@ -437,6 +488,10 @@ void ServerLevel::unloadChunks(Keep keep, int64_t gameTime) {
         saveChunk(*it->second, gameTime);
         unloadEntities(*it->second);
         ChunkPos pos = it->second->pos();
+        for (const auto& be : it->second->blockEntities) { // LevelChunk.clearAllBlockEntities
+            movingPistons_.erase(BlockPos{be.x, be.y, be.z}.asLong());
+            tickerAt_.erase(BlockPos{be.x, be.y, be.z}.asLong());
+        }
         it = chunks_.erase(it);
         light_->removeChunk(pos.x, pos.z); // ThreadedLevelLightEngine.updateChunkStatus
         lightChanges_.erase(pos.pack());
@@ -465,6 +520,9 @@ public:
     // The day timeline's gameplay/sky_light_level at `totalTicks` into the day (keyframes
     // interpolated linearly, wrapping around the period).
     static float skyLightMultiplier(int64_t totalTicks);
+    // The day timeline's visual/sun_angle at `totalTicks` (degrees; KeyframeTrackSampler with the
+    // track's cubic bezier easing).
+    static float sunAngle(int64_t totalTicks);
     int count() const { return static_cast<int>(clocks_.size()); }
 
 private:

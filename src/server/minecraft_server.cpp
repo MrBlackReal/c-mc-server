@@ -415,9 +415,12 @@ void MinecraftServer::tick() {
     tickCount_++;
     clocks_.tick(advanceTime());
     overworld_->setGameTime(clocks_.gameTime());
+    overworld_->setHandlingTick(true); // ServerLevel.tick: scheduled ticks through block events
     overworld_->tickBlocks();
     overworld_->tickFluids();
     overworld_->tickChunks();
+    overworld_->runBlockEvents();
+    overworld_->setHandlingTick(false);
     overworld_->tickEntities();
     overworld_->tickBlockEntities();
     overworld_->runLightUpdates(); // (ThreadedLevelLightEngine.tryScheduleUpdate, at the end of the level tick)

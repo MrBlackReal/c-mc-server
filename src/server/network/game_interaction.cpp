@@ -310,6 +310,22 @@ bool ServerGamePacketListener::destroyBlock(BlockPos pos) {
         }
     }
 
+    // TripWireBlock.playerWillDestroy: cutting it with shears disarms it first (the hooks don't click).
+    static const int32_t kShears = items::byName("minecraft:shears").value_or(-1);
+    if (block == gen::block::TRIPWIRE && !held.isEmpty() && held.item == kShears) {
+        state = bs::setBool(state, "disarmed", true);
+        level.setBlock(pos, state, ServerLevel::kUpdateInvisible | ServerLevel::kSkipBlockEntitySideEffects);
+    }
+    // PistonHeadBlock.playerWillDestroy: in creative the base goes too, without drops.
+    if (block == gen::block::PISTON_HEAD && creative) {
+        Direction f = direction::byName(bs::getValue(state, "facing").value_or("north"));
+        BlockPos basePos = pos.relative(direction::opposite(f));
+        BlockStateId base = level.getBlockState(basePos);
+        uint32_t want = bs::getValue(state, "type") == "sticky" ? gen::block::STICKY_PISTON : gen::block::PISTON;
+        if (bs::is(base, want) && bs::getBool(base, "extended") && bs::getValue(base, "facing") == bs::getValue(state, "facing"))
+            level.destroyBlock(basePos, false);
+    }
+
     // DecoratedPotBlock.playerWillDestroy: tools that break pots crack them (drops sherds, not the pot),
     // unless an enchantment prevents shattering.
     if (bs::isInstance(block, "DecoratedPotBlock") && items::hasTag(held.item, "minecraft:breaks_decorated_pots")) {
@@ -464,6 +480,7 @@ void ServerGamePacketListener::createBlockEntityFromItem(BlockPos pos, BlockStat
     // Player.canUseGameMasterBlocks: creative and op; there are no ops yet, so creative decides.
     block_entity::applyItem(be->tag, stack, player_.gameMode == GameType::Creative);
     chunk.dirty = true;
+    player_.level().blockEntitySetChanged(pos);
 }
 
 // ---------------------------------------------------------------- inventory
